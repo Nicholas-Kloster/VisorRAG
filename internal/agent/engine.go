@@ -160,7 +160,13 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 	runID := newRunID()
 
 	// ---- Retrieve ----
-	hits, err := e.rag.Search(ctx, target+" recon enumeration playbook", 4)
+	// Query carries general recon vocabulary spanning all playbook
+	// categories (web/cloud/api/ai-ml/AI-OSINT) so the diversified Search
+	// (top-1 per source) surfaces the most relevant chunk from each rather
+	// than letting one playbook's keywords dominate. Earlier seed
+	// "recon enumeration playbook" overlapped heavily with ai-ml.md's
+	// vocabulary; this seed is more neutral.
+	hits, err := e.rag.Search(ctx, target+" service infrastructure exposure http tls port scan recon", 4)
 	if err != nil {
 		e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "rag search failed: " + err.Error()})
 	}
