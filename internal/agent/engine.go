@@ -205,7 +205,11 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 		// No tool calls → terminal turn.
 		if len(resp.ToolCalls) == 0 {
 			e.emit(Event{Time: time.Now(), Type: "final", Step: step, RunID: runID, Message: resp.Text})
-			if err := e.generateCortexArtifact(ctx, target, runID, history); err != nil {
+			// Append the agent's final narrative to history so Cortex sees
+			// it as ground-truth synthesis material (not just raw tool
+			// observations).
+			finalHistory := append(history, Message{Role: RoleAssistant, Content: resp.Text})
+			if err := e.generateCortexArtifact(ctx, target, runID, finalHistory); err != nil {
 				e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "cortex: " + err.Error()})
 			}
 			return resp.Text, nil
