@@ -36,10 +36,13 @@ type ExecResult struct {
 }
 
 func Detect() (string, error) {
+	// Order: prefer admin-installed (/usr/local) over distro-package
+	// (/usr/bin) so a fresh gvisor.dev release can shadow an outdated
+	// apt package without requiring removal. Conventional Unix precedence.
 	candidates := []string{
-		"/usr/bin/runsc",
 		"/usr/local/bin/runsc",
 		"/opt/runsc/runsc",
+		"/usr/bin/runsc",
 	}
 	for _, p := range candidates {
 		if info, err := os.Stat(p); err == nil && !info.IsDir() {
