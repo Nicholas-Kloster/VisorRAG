@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -639,6 +640,69 @@ func TestManualGateRejectedFindingPersisted(t *testing.T) {
 	}
 	if !sawRejected {
 		t.Errorf("no persisted finding with status=rejected and rejection reason: %+v", prior)
+	}
+}
+
+// TestSchemaHintTypeInference: hint values with different JSON types must
+// produce schemas with matching JSON-Schema types. A regression of the
+// "everything is a string" bug bit us on the first live Groq run because
+// llama-3.3 correctly emitted `top: 100` (number) but the schema declared
+// `top: string`, causing strict server-side validation to reject the call.
+func TestSchemaHintTypeInference(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		hint     string
+		wantType map[string]string // property name → expected schema "type"
+	}{
+		{
+			name:     "naabu hint with string + number",
+			hint:     `{"target":"<ip|host>","top":100}`,
+			wantType: map[string]string{"target": "string", "top": "integer"},
+		},
+		{
+			name:     "nuclei hint with string array",
+			hint:     `{"target":"<url>","tags":["exposure","cve"],"severity":"low,medium"}`,
+			wantType: map[string]string{"target": "string", "tags": "array", "severity": "string"},
+		},
+		{
+			name:     "boolean property",
+			hint:     `{"target":"<host>","verbose":true}`,
+			wantType: map[string]string{"target": "string", "verbose": "boolean"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := schemaHintToJSONSchema(tc.hint)
+			var parsed struct {
+				Type       string                            `json:"type"`
+				Properties map[string]map[string]interface{} `json:"properties"`
+				Required   []string                          `json:"required"`
+			}
+			if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+				t.Fatalf("invalid JSON: %v\n%s", err, got)
+			}
+			for prop, wantTy := range tc.wantType {
+				p, ok := parsed.Properties[prop]
+				if !ok {
+					t.Errorf("property %q missing from schema: %s", prop, got)
+					continue
+				}
+				if p["type"] != wantTy {
+					t.Errorf("property %q type = %v, want %s", prop, p["type"], wantTy)
+				}
+			}
+			// "target" should always be required.
+			var hasTarget bool
+			for _, r := range parsed.Required {
+				if r == "target" {
+					hasTarget = true
+				}
+			}
+			if !hasTarget {
+				t.Errorf("expected target in required list, got %v", parsed.Required)
+			}
+		})
 	}
 }
 

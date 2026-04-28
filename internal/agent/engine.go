@@ -308,10 +308,19 @@ func shortID(id string) string {
 	return id
 }
 
-// schemaHintToJSONSchema converts our terse hint string (e.g.
-// `{"target":"<ip|host>","ports":"..."}`) into a valid JSON-Schema-ish object
-// that providers will accept. We keep the user-facing hints terse for
-// readability; this helper inflates them on the way to the model.
+// schemaHintToJSONSchema converts our terse hint string into a valid
+// JSON-Schema object the model+provider will accept. The hint encodes type
+// information through the value's JSON type:
+//
+//   - string value → "string" (description = the hint text)
+//   - number value → "integer" (or "number" for floats)
+//   - bool value   → "boolean"
+//   - array value  → "array" (items inferred from first element)
+//   - everything else → object passthrough
+//
+// Earlier this function declared every property as "string", which made
+// strict providers (Groq) reject perfectly valid model output like
+// `naabu(top: 100)` because 100 is a number, not a string.
 func schemaHintToJSONSchema(hint string) string {
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(hint), &raw); err != nil {
@@ -320,11 +329,7 @@ func schemaHintToJSONSchema(hint string) string {
 	props := map[string]any{}
 	required := []string{}
 	for k, v := range raw {
-		desc := ""
-		if s, ok := v.(string); ok {
-			desc = s
-		}
-		props[k] = map[string]any{"type": "string", "description": desc}
+		props[k] = inferSchemaProperty(v)
 		if k == "target" {
 			required = append(required, k)
 		}
@@ -338,6 +343,32 @@ func schemaHintToJSONSchema(hint string) string {
 	}
 	b, _ := json.Marshal(out)
 	return string(b)
+}
+
+func inferSchemaProperty(v any) map[string]any {
+	switch x := v.(type) {
+	case string:
+		return map[string]any{"type": "string", "description": x}
+	case float64:
+		// json.Unmarshal decodes all numbers as float64. Treat integer-valued
+		// floats as integers since our tool args are predominantly counts/ports.
+		if x == float64(int64(x)) {
+			return map[string]any{"type": "integer"}
+		}
+		return map[string]any{"type": "number"}
+	case bool:
+		return map[string]any{"type": "boolean"}
+	case []any:
+		item := map[string]any{"type": "string"}
+		if len(x) > 0 {
+			item = inferSchemaProperty(x[0])
+		}
+		return map[string]any{"type": "array", "items": item}
+	case map[string]any:
+		return map[string]any{"type": "object", "additionalProperties": true}
+	default:
+		return map[string]any{"type": "string"}
+	}
 }
 
 func truncate(s string, n int) string {
