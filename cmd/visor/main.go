@@ -11,12 +11,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +42,7 @@ func main() {
 		quiet          bool
 		stateDir       string
 		ephemeral      bool
+		manual         bool
 	)
 
 	root := &cobra.Command{
@@ -82,11 +86,17 @@ func main() {
 			reg := tools.NewRegistry(exec)
 
 			enc := json.NewEncoder(os.Stdout)
+			var approver agent.Approver
+			if manual {
+				approver = newStdinApprover(os.Stdin, os.Stderr)
+				fmt.Fprintln(os.Stderr, "visor: --manual gate active. y=approve, n=reject, anything else=reject with that text as guidance to the agent.")
+			}
 			eng := agent.New(agent.Config{
 				Model:    model,
 				RAG:      ragEngine,
 				Tools:    reg,
 				MaxSteps: maxSteps,
+				Approve:  approver,
 				OnEvent: func(e agent.Event) {
 					if quiet && e.Type != "final" && e.Type != "error" {
 						return
@@ -112,10 +122,49 @@ func main() {
 	root.Flags().BoolVar(&quiet, "quiet", false, "suppress per-step events; only emit final summary")
 	root.Flags().StringVar(&stateDir, "state-dir", "", "directory for persisted findings (default ~/.visor-rag/state)")
 	root.Flags().BoolVar(&ephemeral, "ephemeral", false, "disable findings persistence for this run")
+	root.Flags().BoolVar(&manual, "manual", false, "interactively approve every tool invocation (y/n/<reason text>)")
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "visor:", err)
 		os.Exit(1)
+	}
+}
+
+// newStdinApprover builds an Approver that reads y/n/reason from in (typically
+// os.Stdin) and prints the prompt to errOut (typically os.Stderr so JSONL
+// stdout stays clean for piping).
+//
+// Inputs:
+//   - "y" / "yes"           → approve
+//   - "n" / "no" / empty    → reject with default reason
+//   - any other text        → reject, that text becomes the rejection reason
+//     fed back to the agent (lets the operator guide the model toward a
+//     lighter alternative without ending the run)
+//
+// Reads are serialized via a mutex so concurrent tool calls in a single
+// turn would queue cleanly (Anthropic rarely emits parallel tool_use, but
+// belt-and-suspenders).
+func newStdinApprover(in *os.File, errOut *os.File) agent.Approver {
+	br := bufio.NewReader(in)
+	var mu sync.Mutex
+	return func(_ context.Context, req agent.ApprovalRequest) (agent.ApprovalDecision, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		fmt.Fprintf(errOut, "\n[manual] step=%d run=%s tool=%s\n        args=%s\napprove? [y/N/<reason>] > ",
+			req.Step, req.RunID, req.Tool, req.Args)
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return agent.ApprovalDecision{}, fmt.Errorf("read approval input: %w", err)
+		}
+		ans := strings.TrimSpace(line)
+		switch strings.ToLower(ans) {
+		case "y", "yes":
+			return agent.ApprovalDecision{Approved: true}, nil
+		case "", "n", "no":
+			return agent.ApprovalDecision{Approved: false, Reason: "operator declined"}, nil
+		default:
+			return agent.ApprovalDecision{Approved: false, Reason: ans}, nil
+		}
 	}
 }
 

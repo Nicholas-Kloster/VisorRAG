@@ -47,21 +47,47 @@ type Event struct {
 	Extra    map[string]any `json:"extra,omitempty"`
 }
 
+// Approver is consulted before each tool invocation in the act step. It
+// returns approved=true to let the tool run normally, or approved=false to
+// short-circuit with the given reason becoming the observation fed back to
+// the model. An error aborts the run.
+//
+// Use cases: --manual interactive gating from stdin; policy-driven
+// allow/deny in non-interactive automation; per-tool budget enforcement.
+type Approver func(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error)
+
+type ApprovalRequest struct {
+	RunID string
+	Step  int
+	Tool  string
+	Args  string
+}
+
+type ApprovalDecision struct {
+	Approved bool
+	// Reason is shown to the model when Approved=false. If empty, a default
+	// "User rejected tool execution" message is used.
+	Reason string
+}
+
 // Engine wires Retrieve → Think → Act in a ReAct loop.
 type Engine struct {
-	model     Model
-	rag       *rag.Engine
-	tools     *tools.Registry
-	maxSteps  int
-	emit      func(Event)
+	model    Model
+	rag      *rag.Engine
+	tools    *tools.Registry
+	maxSteps int
+	emit     func(Event)
+	approve  Approver
 }
 
 type Config struct {
-	Model     Model
-	RAG       *rag.Engine
-	Tools     *tools.Registry
-	MaxSteps  int
-	OnEvent   func(Event)
+	Model    Model
+	RAG      *rag.Engine
+	Tools    *tools.Registry
+	MaxSteps int
+	OnEvent  func(Event)
+	// Approve, if non-nil, gates every tool invocation. Nil = auto-approve.
+	Approve Approver
 }
 
 func New(cfg Config) *Engine {
@@ -77,6 +103,7 @@ func New(cfg Config) *Engine {
 		tools:    cfg.Tools,
 		maxSteps: cfg.MaxSteps,
 		emit:     cfg.OnEvent,
+		approve:  cfg.Approve,
 	}
 }
 
@@ -161,18 +188,48 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 		// Execute each tool call, emit observations, persist, append results.
 		for _, tc := range resp.ToolCalls {
 			e.emit(Event{Time: time.Now(), Type: "act", Step: step, RunID: runID, Tool: tc.Name, Args: tc.Input})
+
+			var (
+				result string
+				status = "ok"
+			)
 			tool, ok := e.tools.Get(tc.Name)
-			var result string
-			if !ok {
-				result = fmt.Sprintf("ERROR: unknown tool %q. Available: %s", tc.Name, strings.Join(e.tools.Names(), ", "))
-			} else {
-				out, err := tool.Run(ctx, tc.Input)
+
+			// ---- Approval gate ----
+			if e.approve != nil {
+				decision, err := e.approve(ctx, ApprovalRequest{
+					RunID: runID, Step: step, Tool: tc.Name, Args: tc.Input,
+				})
 				if err != nil {
-					result = "ERROR: " + err.Error()
-				} else {
-					result = truncate(out, 8000)
+					e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "approval: " + err.Error()})
+					return "", fmt.Errorf("approval: %w", err)
+				}
+				if !decision.Approved {
+					reason := strings.TrimSpace(decision.Reason)
+					if reason == "" {
+						reason = "no reason given"
+					}
+					result = fmt.Sprintf("User rejected tool execution. Reason: %s", reason)
+					status = "rejected"
 				}
 			}
+
+			// ---- Tool execution (only if not already rejected) ----
+			if status != "rejected" {
+				if !ok {
+					result = fmt.Sprintf("ERROR: unknown tool %q. Available: %s", tc.Name, strings.Join(e.tools.Names(), ", "))
+					status = "error"
+				} else {
+					out, err := tool.Run(ctx, tc.Input)
+					if err != nil {
+						result = "ERROR: " + err.Error()
+						status = "error"
+					} else {
+						result = truncate(out, 8000)
+					}
+				}
+			}
+
 			e.emit(Event{Time: time.Now(), Type: "observe", Step: step, RunID: runID, Tool: tc.Name, Result: result})
 
 			if err := e.rag.AddFinding(ctx, rag.Finding{
@@ -182,6 +239,7 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 				Step:      step,
 				Args:      tc.Input,
 				Output:    result,
+				Status:    status,
 				Timestamp: time.Now().UTC(),
 			}); err != nil {
 				e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "persist finding: " + err.Error()})

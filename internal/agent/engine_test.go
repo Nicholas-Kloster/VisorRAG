@@ -477,6 +477,171 @@ func TestEphemeralModeDoesNotPersist(t *testing.T) {
 	}
 }
 
+// TestManualGateRejectionPivots: when the Approver rejects a tool call,
+// the tool must NOT execute; the rejection reason must be threaded back
+// to the model as the observation so the agent can pivot.
+func TestManualGateRejectionPivots(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	probe := &fakeTool{name: "probe", desc: "x", schema: `{"target":"<host>"}`,
+		handler: func(string) (string, error) { return "should-never-run", nil }}
+
+	model := newFakeModel("rejected",
+		&Response{ToolCalls: []ToolCall{{ID: "tu_r", Name: "probe", Input: `{"target":"x"}`}}},
+		&Response{Text: "summary: pivoted per operator", StopReason: "end_turn"},
+	)
+	reg := tools.NewEmpty()
+	reg.Register(probe)
+
+	const reason = "scan too heavy, try lighter alternative"
+	rejector := func(_ context.Context, _ ApprovalRequest) (ApprovalDecision, error) {
+		return ApprovalDecision{Approved: false, Reason: reason}, nil
+	}
+
+	cap := &capturedEvents{}
+	eng := New(Config{
+		Model:    model,
+		RAG:      mustRAG(t),
+		Tools:    reg,
+		MaxSteps: 4,
+		Approve:  rejector,
+		OnEvent:  cap.on,
+	})
+	if _, err := eng.Run(ctx, "x"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if probe.callCount != 0 {
+		t.Errorf("rejected probe ran anyway: callCount=%d", probe.callCount)
+	}
+
+	// The model's second-call history must contain the rejection text.
+	hist := model.lastHistory()
+	if len(hist) < 3 {
+		t.Fatalf("expected ≥3 history entries on second call, got %d", len(hist))
+	}
+	toolMsg := hist[len(hist)-1]
+	if toolMsg.Role != RoleTool {
+		t.Errorf("expected last history entry to be tool result, got role=%v", toolMsg.Role)
+	}
+	if !strings.Contains(toolMsg.Content, "User rejected") {
+		t.Errorf("tool message missing rejection marker: %q", toolMsg.Content)
+	}
+	if !strings.Contains(toolMsg.Content, reason) {
+		t.Errorf("rejection reason not threaded to model: %q", toolMsg.Content)
+	}
+
+	// Observe event should also carry the rejection.
+	var observed string
+	for _, e := range cap.ev {
+		if e.Type == "observe" {
+			observed = e.Result
+		}
+	}
+	if !strings.Contains(observed, reason) {
+		t.Errorf("observe event missing rejection reason: %q", observed)
+	}
+}
+
+// TestManualGateApprovalRunsTool: happy-path — Approver returns true,
+// tool runs as normal, output threads back through history.
+func TestManualGateApprovalRunsTool(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	probe := &fakeTool{name: "probe", desc: "x", schema: `{"target":"<host>"}`,
+		handler: func(string) (string, error) { return "approved-output-7K", nil }}
+
+	model := newFakeModel("approved",
+		&Response{ToolCalls: []ToolCall{{ID: "tu_a", Name: "probe", Input: `{"target":"x"}`}}},
+		&Response{Text: "summary: clean run", StopReason: "end_turn"},
+	)
+	reg := tools.NewEmpty()
+	reg.Register(probe)
+
+	approver := func(_ context.Context, _ ApprovalRequest) (ApprovalDecision, error) {
+		return ApprovalDecision{Approved: true}, nil
+	}
+
+	eng := New(Config{
+		Model:    model,
+		RAG:      mustRAG(t),
+		Tools:    reg,
+		MaxSteps: 4,
+		Approve:  approver,
+		OnEvent:  func(Event) {},
+	})
+	if _, err := eng.Run(ctx, "x"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if probe.callCount != 1 {
+		t.Errorf("approved probe should run exactly once, got callCount=%d", probe.callCount)
+	}
+	hist := model.lastHistory()
+	toolMsg := hist[len(hist)-1]
+	if !strings.Contains(toolMsg.Content, "approved-output-7K") {
+		t.Errorf("tool output not threaded: %q", toolMsg.Content)
+	}
+}
+
+// TestManualGateRejectedFindingPersisted: a rejected call should still
+// appear in the persistent findings collection with status=rejected so
+// future runs see "I tried this, the operator said no, with reason X".
+func TestManualGateRejectedFindingPersisted(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	stateDir := t.TempDir()
+	const targetIP = "192.0.2.99"
+
+	probe := &fakeTool{name: "probe", desc: "x", schema: `{"target":"<host>"}`,
+		handler: func(string) (string, error) { return "never", nil }}
+
+	model := newFakeModel("rejpersist",
+		&Response{ToolCalls: []ToolCall{{ID: "tu_p", Name: "probe", Input: `{"target":"192.0.2.99"}`}}},
+		&Response{Text: "ack", StopReason: "end_turn"},
+	)
+	reg := tools.NewEmpty()
+	reg.Register(probe)
+
+	rejector := func(_ context.Context, _ ApprovalRequest) (ApprovalDecision, error) {
+		return ApprovalDecision{Approved: false, Reason: "DENIED-MARKER-9X"}, nil
+	}
+
+	eng := New(Config{
+		Model:    model,
+		RAG:      mustPersistentRAG(t, stateDir),
+		Tools:    reg,
+		MaxSteps: 3,
+		Approve:  rejector,
+		OnEvent:  func(Event) {},
+	})
+	if _, err := eng.Run(ctx, targetIP); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Re-open the engine; verify the rejected finding is queryable.
+	rag2 := mustPersistentRAG(t, stateDir)
+	prior, err := rag2.FindingsForTarget(ctx, targetIP, 5)
+	if err != nil {
+		t.Fatalf("findings query: %v", err)
+	}
+	if len(prior) == 0 {
+		t.Fatalf("rejected finding not persisted")
+	}
+	var sawRejected bool
+	for _, f := range prior {
+		if f.Status == "rejected" && strings.Contains(f.Output, "DENIED-MARKER-9X") {
+			sawRejected = true
+		}
+	}
+	if !sawRejected {
+		t.Errorf("no persisted finding with status=rejected and rejection reason: %+v", prior)
+	}
+}
+
 // ------------- tiny helpers -------------
 
 func trim(s string) string {
