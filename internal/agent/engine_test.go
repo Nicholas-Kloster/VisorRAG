@@ -86,6 +86,19 @@ func mustRAG(t *testing.T) *rag.Engine {
 	return r
 }
 
+func mustPersistentRAG(t *testing.T, stateDir string) *rag.Engine {
+	t.Helper()
+	r, err := rag.NewWithOptions(context.Background(), rag.Options{
+		Embedder:      fakeEmbedder,
+		EmbedderLabel: "fake-bag-of-words",
+		StateDir:      stateDir,
+	})
+	if err != nil {
+		t.Fatalf("rag init (persistent): %v", err)
+	}
+	return r
+}
+
 type capturedEvents struct {
 	mu sync.Mutex
 	ev []Event
@@ -354,7 +367,124 @@ func TestEventTimingSane(t *testing.T) {
 	}
 }
 
+// TestPersistedFindingsCarryAcrossRuns: two sequential agent runs against
+// the same target sharing a state-dir. The second run's initial prompt
+// must contain the first run's tool output. Proves the persistence path
+// closes the loop end-to-end: AddFinding writes to disk, FindingsForTarget
+// reads them back, buildInitialPrompt injects them into history.
+func TestPersistedFindingsCarryAcrossRuns(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	stateDir := t.TempDir()
+	const targetIP = "192.0.2.42"
+	const probeOutput = "OPEN: 192.0.2.42:8080 banner=NUCLIDE-CANARY-7F3"
+
+	probe := &fakeTool{
+		name:    "probe",
+		desc:    "fake probe returning a uniquely identifiable banner",
+		schema:  `{"target":"<host>"}`,
+		handler: func(args string) (string, error) { return probeOutput, nil },
+	}
+
+	// ---- Run 1: model calls probe, then summarizes. ----
+	{
+		model := newFakeModel("run1",
+			&Response{ToolCalls: []ToolCall{{ID: "tu_a", Name: "probe", Input: `{"target":"192.0.2.42"}`}}},
+			&Response{Text: "summary: scanned, banner captured", StopReason: "end_turn"},
+		)
+		reg := tools.NewEmpty()
+		reg.Register(probe)
+
+		eng := New(Config{
+			Model:    model,
+			RAG:      mustPersistentRAG(t, stateDir),
+			Tools:    reg,
+			MaxSteps: 4,
+			OnEvent:  func(Event) {},
+		})
+		if _, err := eng.Run(ctx, targetIP); err != nil {
+			t.Fatalf("run 1: %v", err)
+		}
+	}
+
+	// ---- Run 2: fresh agent + fresh RAG engine, same state-dir. ----
+	model2 := newFakeModel("run2", &Response{Text: "summary: prior data sufficient", StopReason: "end_turn"})
+	reg2 := tools.NewEmpty()
+	reg2.Register(probe)
+
+	rag2 := mustPersistentRAG(t, stateDir)
+	if got := rag2.FindingsCount(); got < 1 {
+		t.Fatalf("findings collection did not persist across constructions: count=%d", got)
+	}
+
+	eng2 := New(Config{
+		Model:    model2,
+		RAG:      rag2,
+		Tools:    reg2,
+		MaxSteps: 4,
+		OnEvent:  func(Event) {},
+	})
+	if _, err := eng2.Run(ctx, targetIP); err != nil {
+		t.Fatalf("run 2: %v", err)
+	}
+
+	// The second run must have seen the first run's probe output in its
+	// initial user prompt.
+	hist := model2.lastHistory()
+	if len(hist) == 0 {
+		t.Fatal("run 2 model saw empty history")
+	}
+	prompt := hist[0].Content
+	if !strings.Contains(prompt, "PRIOR FINDINGS ON THIS TARGET") {
+		t.Errorf("run 2 prompt missing PRIOR FINDINGS section: %q", trim(prompt))
+	}
+	if !strings.Contains(prompt, "NUCLIDE-CANARY-7F3") {
+		t.Errorf("run 2 prompt did not surface run 1 probe banner. Prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "tool=probe") {
+		t.Errorf("run 2 prompt missing tool metadata: %q", trim(prompt))
+	}
+}
+
+// TestEphemeralModeDoesNotPersist: when StateDir is empty, AddFinding is a
+// no-op and a second engine reads zero findings.
+func TestEphemeralModeDoesNotPersist(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	probe := &fakeTool{name: "probe", desc: "x", schema: `{"target":"<host>"}`,
+		handler: func(string) (string, error) { return "ephemeral-output", nil }}
+
+	model := newFakeModel("eph",
+		&Response{ToolCalls: []ToolCall{{ID: "tu_e", Name: "probe", Input: `{}`}}},
+		&Response{Text: "done", StopReason: "end_turn"},
+	)
+	reg := tools.NewEmpty()
+	reg.Register(probe)
+
+	eph := mustRAG(t) // no state dir
+	if eph.HasPersistence() {
+		t.Fatalf("expected ephemeral engine to have no persistence")
+	}
+
+	eng := New(Config{Model: model, RAG: eph, Tools: reg, MaxSteps: 3, OnEvent: func(Event) {}})
+	if _, err := eng.Run(ctx, "x"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := eph.FindingsCount(); got != 0 {
+		t.Errorf("ephemeral findings count = %d, want 0", got)
+	}
+}
+
 // ------------- tiny helpers -------------
+
+func trim(s string) string {
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
+}
 
 func equalSlice(a, b []string) bool {
 	if len(a) != len(b) {

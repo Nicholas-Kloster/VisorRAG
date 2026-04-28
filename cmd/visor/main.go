@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -36,6 +37,8 @@ func main() {
 		maxSteps       int
 		sandboxTimeout time.Duration
 		quiet          bool
+		stateDir       string
+		ephemeral      bool
 	)
 
 	root := &cobra.Command{
@@ -56,9 +59,19 @@ func main() {
 				return fmt.Errorf("sandbox init: %w", err)
 			}
 
-			ragEngine, err := rag.New(ctx)
+			resolvedStateDir, err := resolveStateDir(stateDir, ephemeral)
+			if err != nil {
+				return err
+			}
+			ragEngine, err := rag.NewPersistent(ctx, resolvedStateDir)
 			if err != nil {
 				return fmt.Errorf("rag init: %w", err)
+			}
+			if ragEngine.HasPersistence() {
+				fmt.Fprintf(os.Stderr, "visor: findings persisted at %s (count=%d)\n",
+					ragEngine.FindingsDir(), ragEngine.FindingsCount())
+			} else {
+				fmt.Fprintln(os.Stderr, "visor: persistence disabled (--ephemeral); findings will not survive this run")
 			}
 
 			model, err := agent.PickModel()
@@ -97,9 +110,26 @@ func main() {
 	root.Flags().IntVar(&maxSteps, "max-steps", 12, "agent step budget")
 	root.Flags().DurationVar(&sandboxTimeout, "sandbox-timeout", 5*time.Minute, "per-probe sandbox timeout")
 	root.Flags().BoolVar(&quiet, "quiet", false, "suppress per-step events; only emit final summary")
+	root.Flags().StringVar(&stateDir, "state-dir", "", "directory for persisted findings (default ~/.visor-rag/state)")
+	root.Flags().BoolVar(&ephemeral, "ephemeral", false, "disable findings persistence for this run")
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "visor:", err)
 		os.Exit(1)
 	}
 }
+
+func resolveStateDir(flag string, ephemeral bool) (string, error) {
+	if ephemeral {
+		return "", nil
+	}
+	if flag != "" {
+		return flag, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	return filepath.Join(home, ".visor-rag", "state"), nil
+}
+

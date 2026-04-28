@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -32,15 +34,17 @@ func PickModel() (Model, error) {
 
 // Event is a single line of streaming output emitted to the consumer.
 type Event struct {
-	Time    time.Time      `json:"time"`
-	Type    string         `json:"type"` // "retrieve" | "think" | "act" | "observe" | "final" | "error"
-	Step    int            `json:"step"`
-	Message string         `json:"message,omitempty"`
-	Tool    string         `json:"tool,omitempty"`
-	Args    string         `json:"args,omitempty"`
-	Result  string         `json:"result,omitempty"`
-	Hits    []rag.Hit      `json:"hits,omitempty"`
-	Extra   map[string]any `json:"extra,omitempty"`
+	Time     time.Time      `json:"time"`
+	Type     string         `json:"type"` // "retrieve" | "think" | "act" | "observe" | "final" | "error"
+	Step     int            `json:"step"`
+	RunID    string         `json:"run_id,omitempty"`
+	Message  string         `json:"message,omitempty"`
+	Tool     string         `json:"tool,omitempty"`
+	Args     string         `json:"args,omitempty"`
+	Result   string         `json:"result,omitempty"`
+	Hits     []rag.Hit      `json:"hits,omitempty"`
+	Findings []rag.Finding  `json:"findings,omitempty"`
+	Extra    map[string]any `json:"extra,omitempty"`
 }
 
 // Engine wires Retrieve → Think → Act in a ReAct loop.
@@ -102,13 +106,18 @@ Output discipline:
 // Run executes the ReAct loop on a single target. Returns the final summary.
 func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 	step := 0
+	runID := newRunID()
 
 	// ---- Retrieve ----
 	hits, err := e.rag.Search(ctx, target+" recon enumeration playbook", 4)
 	if err != nil {
-		e.emit(Event{Time: time.Now(), Type: "error", Step: step, Message: "rag search failed: " + err.Error()})
+		e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "rag search failed: " + err.Error()})
 	}
-	e.emit(Event{Time: time.Now(), Type: "retrieve", Step: step, Hits: hits})
+	priorFindings, err := e.rag.FindingsForTarget(ctx, target, 6)
+	if err != nil {
+		e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "findings retrieval failed: " + err.Error()})
+	}
+	e.emit(Event{Time: time.Now(), Type: "retrieve", Step: step, RunID: runID, Hits: hits, Findings: priorFindings})
 
 	// Tool advertisement
 	specs := make([]ToolSpec, 0, len(e.tools.Names()))
@@ -124,21 +133,21 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 	// Seed conversation
 	history := []Message{{
 		Role:    RoleUser,
-		Content: buildInitialPrompt(target, hits, e.tools),
+		Content: buildInitialPrompt(target, hits, priorFindings, e.tools),
 	}}
 
 	for step = 1; step <= e.maxSteps; step++ {
-		e.emit(Event{Time: time.Now(), Type: "think", Step: step, Message: "model: " + e.model.Name()})
+		e.emit(Event{Time: time.Now(), Type: "think", Step: step, RunID: runID, Message: "model: " + e.model.Name()})
 
 		resp, err := e.model.Generate(ctx, systemPrompt, history, specs)
 		if err != nil {
-			e.emit(Event{Time: time.Now(), Type: "error", Step: step, Message: err.Error()})
+			e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: err.Error()})
 			return "", err
 		}
 
 		// No tool calls → terminal turn.
 		if len(resp.ToolCalls) == 0 {
-			e.emit(Event{Time: time.Now(), Type: "final", Step: step, Message: resp.Text})
+			e.emit(Event{Time: time.Now(), Type: "final", Step: step, RunID: runID, Message: resp.Text})
 			return resp.Text, nil
 		}
 
@@ -149,9 +158,9 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 			ToolCalls: resp.ToolCalls,
 		})
 
-		// Execute each tool call, emit observations, append results.
+		// Execute each tool call, emit observations, persist, append results.
 		for _, tc := range resp.ToolCalls {
-			e.emit(Event{Time: time.Now(), Type: "act", Step: step, Tool: tc.Name, Args: tc.Input})
+			e.emit(Event{Time: time.Now(), Type: "act", Step: step, RunID: runID, Tool: tc.Name, Args: tc.Input})
 			tool, ok := e.tools.Get(tc.Name)
 			var result string
 			if !ok {
@@ -164,7 +173,20 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 					result = truncate(out, 8000)
 				}
 			}
-			e.emit(Event{Time: time.Now(), Type: "observe", Step: step, Tool: tc.Name, Result: result})
+			e.emit(Event{Time: time.Now(), Type: "observe", Step: step, RunID: runID, Tool: tc.Name, Result: result})
+
+			if err := e.rag.AddFinding(ctx, rag.Finding{
+				Target:    target,
+				Tool:      tc.Name,
+				RunID:     runID,
+				Step:      step,
+				Args:      tc.Input,
+				Output:    result,
+				Timestamp: time.Now().UTC(),
+			}); err != nil {
+				e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "persist finding: " + err.Error()})
+			}
+
 			history = append(history, Message{
 				Role:      RoleTool,
 				ToolUseID: tc.ID,
@@ -173,15 +195,15 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 		}
 	}
 
-	e.emit(Event{Time: time.Now(), Type: "final", Step: step, Message: "step budget exhausted"})
+	e.emit(Event{Time: time.Now(), Type: "final", Step: step, RunID: runID, Message: "step budget exhausted"})
 	return "step budget exhausted before agent finished", nil
 }
 
-func buildInitialPrompt(target string, hits []rag.Hit, reg *tools.Registry) string {
+func buildInitialPrompt(target string, hits []rag.Hit, prior []rag.Finding, reg *tools.Registry) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "TARGET: %s\n\n", target)
 
-	sb.WriteString("RECON CONTEXT (from playbooks):\n")
+	sb.WriteString("RECON CONTEXT (from playbooks — general operator knowledge):\n")
 	if len(hits) == 0 {
 		sb.WriteString("(no relevant playbook chunks)\n")
 	} else {
@@ -189,11 +211,36 @@ func buildInitialPrompt(target string, hits []rag.Hit, reg *tools.Registry) stri
 			fmt.Fprintf(&sb, "\n[%d] %s :: %s (sim=%.2f)\n%s\n", i+1, h.Source, h.Section, h.Similarity, h.Content)
 		}
 	}
+
+	if len(prior) > 0 {
+		sb.WriteString("\nPRIOR FINDINGS ON THIS TARGET (empirical, from previous runs):\n")
+		for i, f := range prior {
+			fmt.Fprintf(&sb, "\n[%d] run=%s step=%d tool=%s status=%s @ %s\nargs: %s\n%s\n",
+				i+1, shortID(f.RunID), f.Step, f.Tool, f.Status,
+				f.Timestamp.Format(time.RFC3339), f.Args,
+				truncate(f.Output, 1500))
+		}
+		sb.WriteString("\nUse these as ground truth: if a prior run already established a fact, do not re-probe it. Build on it.\n")
+	}
+
 	sb.WriteString("\nTOOLS AVAILABLE (all run inside a gVisor sandbox):\n")
 	sb.WriteString(reg.Manifest())
 
 	sb.WriteString("\nBegin reconnaissance. Be surgical. Stop when you have enough to summarize.\n")
 	return sb.String()
+}
+
+func newRunID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // schemaHintToJSONSchema converts our terse hint string (e.g.

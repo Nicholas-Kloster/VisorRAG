@@ -1,6 +1,15 @@
-// Package rag provides a zero-dependency vector retrieval layer over
-// VisorRAG's recon playbooks. Backed by chromem-go (pure Go), with playbook
-// markdown embedded into the binary via go:embed.
+// Package rag provides a two-collection vector retrieval layer over
+// VisorRAG's recon corpus, backed by chromem-go (pure Go).
+//
+// Collections:
+//
+//   - Playbooks (in-memory): embedded markdown chunks, rebuilt every start.
+//     Edits to playbook .md files reach the index on the next build with no
+//     migration required.
+//   - Findings  (persistent): tool observations from prior agent runs.
+//     Stored at <state-dir>/findings/<embedder-label>/. Namespacing by
+//     embedder label means switching embedders gives a clean store rather
+//     than corrupted similarity.
 //
 // Embedding backend selection (first match wins):
 //  1. VISORRAG_EMBED=ollama  → Ollama at $OLLAMA_HOST or http://localhost:11434
@@ -8,10 +17,6 @@
 //  2. VISORRAG_EMBED=openai  → OpenAI text-embedding-3-small with $OPENAI_API_KEY
 //  3. OPENAI_API_KEY set     → OpenAI text-embedding-3-small (default cloud)
 //  4. fallback               → Ollama nomic-embed-text at localhost:11434
-//
-// The whole DB is in-memory; rebuilt on every process start. Playbooks are
-// chunked by H2 (##) section so each result lands a topical block, not a
-// whole document.
 package rag
 
 import (
@@ -20,7 +25,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/philippgille/chromem-go"
 )
@@ -30,11 +37,20 @@ import (
 // reached from this internal package (go:embed paths are package-local).
 var PlaybookFS fs.FS
 
-const collectionName = "visor-rag-playbooks"
+const (
+	playbookCollName = "visor-rag-playbooks"
+	findingsCollName = "visor-rag-findings"
+)
 
 type Engine struct {
-	db   *chromem.DB
-	coll *chromem.Collection
+	playbookDB   *chromem.DB
+	playbookColl *chromem.Collection
+
+	findingsDB   *chromem.DB         // nil when persistence disabled
+	findingsColl *chromem.Collection // nil when persistence disabled
+	findingsDir  string              // resolved on-disk path, "" when disabled
+	embedFn      chromem.EmbeddingFunc
+	embedLabel   string
 }
 
 type Hit struct {
@@ -44,23 +60,72 @@ type Hit struct {
 	Similarity float32 // 0..1, higher is closer
 }
 
+// Finding is a tool observation persisted across runs.
+type Finding struct {
+	ID        string
+	Target    string
+	Tool      string
+	RunID     string
+	Step      int
+	Args      string
+	Output    string
+	Timestamp time.Time
+	Status    string // "ok" | "error"
+}
+
+// Options configure Engine construction. Embedder + Label are required.
+// StateDir empty disables findings persistence (playbooks still work).
+type Options struct {
+	Embedder      chromem.EmbeddingFunc
+	EmbedderLabel string
+	StateDir      string
+}
+
 func New(ctx context.Context) (*Engine, error) {
 	embedFn, label, err := pickEmbedder()
 	if err != nil {
 		return nil, fmt.Errorf("select embedder: %w", err)
 	}
-	return NewWithEmbedder(ctx, embedFn, label)
+	return NewWithOptions(ctx, Options{Embedder: embedFn, EmbedderLabel: label})
 }
 
-// NewWithEmbedder builds an Engine with a caller-supplied embedding func.
-// Used by tests to swap in a deterministic in-process embedder, and by
-// callers that want to wire a custom embedding backend without going
-// through environment variables.
-func NewWithEmbedder(ctx context.Context, embedFn chromem.EmbeddingFunc, label string) (*Engine, error) {
-	db := chromem.NewDB()
-	coll, err := db.CreateCollection(collectionName, map[string]string{"embedder": label}, embedFn)
+// NewPersistent picks an embedder from environment, then opens the engine
+// with findings persistence rooted at stateDir. Pass an empty stateDir to
+// disable persistence (equivalent to New).
+func NewPersistent(ctx context.Context, stateDir string) (*Engine, error) {
+	embedFn, label, err := pickEmbedder()
 	if err != nil {
-		return nil, fmt.Errorf("create collection: %w", err)
+		return nil, fmt.Errorf("select embedder: %w", err)
+	}
+	return NewWithOptions(ctx, Options{
+		Embedder:      embedFn,
+		EmbedderLabel: label,
+		StateDir:      stateDir,
+	})
+}
+
+// NewWithEmbedder builds an Engine without findings persistence.
+// Kept for backwards compatibility with tests that don't need persistence.
+func NewWithEmbedder(ctx context.Context, embedFn chromem.EmbeddingFunc, label string) (*Engine, error) {
+	return NewWithOptions(ctx, Options{Embedder: embedFn, EmbedderLabel: label})
+}
+
+// NewWithOptions is the canonical constructor.
+func NewWithOptions(ctx context.Context, opts Options) (*Engine, error) {
+	if opts.Embedder == nil {
+		return nil, fmt.Errorf("Options.Embedder is required")
+	}
+	if opts.EmbedderLabel == "" {
+		opts.EmbedderLabel = "unspecified"
+	}
+
+	// Playbooks: always in-memory, always rebuilt.
+	pbDB := chromem.NewDB()
+	pbColl, err := pbDB.CreateCollection(playbookCollName,
+		map[string]string{"embedder": opts.EmbedderLabel},
+		opts.Embedder)
+	if err != nil {
+		return nil, fmt.Errorf("create playbook collection: %w", err)
 	}
 	docs, err := loadPlaybookChunks()
 	if err != nil {
@@ -69,25 +134,59 @@ func NewWithEmbedder(ctx context.Context, embedFn chromem.EmbeddingFunc, label s
 	if len(docs) == 0 {
 		return nil, fmt.Errorf("no playbook chunks found in embedded fs")
 	}
-	if err := coll.AddDocuments(ctx, docs, 4); err != nil {
+	if err := pbColl.AddDocuments(ctx, docs, 4); err != nil {
 		return nil, fmt.Errorf("ingest playbooks: %w", err)
 	}
-	return &Engine{db: db, coll: coll}, nil
+
+	e := &Engine{
+		playbookDB:   pbDB,
+		playbookColl: pbColl,
+		embedFn:      opts.Embedder,
+		embedLabel:   opts.EmbedderLabel,
+	}
+
+	// Findings: optional persistent collection.
+	if opts.StateDir != "" {
+		dir := filepath.Join(opts.StateDir, "findings", sanitizeLabel(opts.EmbedderLabel))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create findings dir: %w", err)
+		}
+		fDB, err := chromem.NewPersistentDB(dir, true)
+		if err != nil {
+			return nil, fmt.Errorf("open findings db: %w", err)
+		}
+		fColl, err := fDB.GetOrCreateCollection(findingsCollName,
+			map[string]string{"embedder": opts.EmbedderLabel},
+			opts.Embedder)
+		if err != nil {
+			return nil, fmt.Errorf("create findings collection: %w", err)
+		}
+		e.findingsDB = fDB
+		e.findingsColl = fColl
+		e.findingsDir = dir
+	}
+
+	return e, nil
 }
+
+// HasPersistence reports whether the engine stores findings to disk.
+func (e *Engine) HasPersistence() bool { return e.findingsColl != nil }
+
+// FindingsDir returns the on-disk findings path, or "" if persistence is off.
+func (e *Engine) FindingsDir() string { return e.findingsDir }
 
 // Search returns up to k playbook chunks most relevant to query.
 func (e *Engine) Search(ctx context.Context, query string, k int) ([]Hit, error) {
 	if k <= 0 {
 		k = 4
 	}
-	if e.coll.Count() == 0 {
+	if e.playbookColl.Count() == 0 {
 		return nil, nil
 	}
-	// chromem-go errors when nResults > collection size.
-	if k > e.coll.Count() {
-		k = e.coll.Count()
+	if k > e.playbookColl.Count() {
+		k = e.playbookColl.Count()
 	}
-	res, err := e.coll.Query(ctx, query, k, nil, nil)
+	res, err := e.playbookColl.Query(ctx, query, k, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -103,8 +202,104 @@ func (e *Engine) Search(ctx context.Context, query string, k int) ([]Hit, error)
 	return hits, nil
 }
 
-// Count returns the number of indexed chunks (for debug / diagnostics).
-func (e *Engine) Count() int { return e.coll.Count() }
+// Count returns the number of indexed playbook chunks.
+func (e *Engine) Count() int { return e.playbookColl.Count() }
+
+// AddFinding persists a single tool observation. No-op when persistence
+// is disabled (returns nil).
+func (e *Engine) AddFinding(ctx context.Context, f Finding) error {
+	if e.findingsColl == nil {
+		return nil
+	}
+	if f.Timestamp.IsZero() {
+		f.Timestamp = time.Now().UTC()
+	}
+	if f.ID == "" {
+		f.ID = fmt.Sprintf("%s::%s::%s::%d", f.Target, f.RunID, f.Tool, f.Step)
+	}
+	if f.Status == "" {
+		if strings.HasPrefix(strings.TrimSpace(f.Output), "ERROR:") {
+			f.Status = "error"
+		} else {
+			f.Status = "ok"
+		}
+	}
+	doc := chromem.Document{
+		ID:      f.ID,
+		Content: f.Output,
+		Metadata: map[string]string{
+			"target":    f.Target,
+			"tool":      f.Tool,
+			"run_id":    f.RunID,
+			"step":      fmt.Sprintf("%d", f.Step),
+			"args":      f.Args,
+			"timestamp": f.Timestamp.UTC().Format(time.RFC3339Nano),
+			"status":    f.Status,
+		},
+	}
+	return e.findingsColl.AddDocument(ctx, doc)
+}
+
+// FindingsForTarget returns up to k prior findings for the given target,
+// most recent first. Returns nil when persistence is disabled.
+//
+// Implementation note: chromem-go's Query is similarity-based. We use the
+// target string as the query and filter by metadata.target, then sort the
+// returned slice by timestamp descending. For small per-target findings
+// pools this is fine; if pools grow large we'd switch to a full scan.
+func (e *Engine) FindingsForTarget(ctx context.Context, target string, k int) ([]Finding, error) {
+	if e.findingsColl == nil {
+		return nil, nil
+	}
+	if e.findingsColl.Count() == 0 {
+		return nil, nil
+	}
+	if k <= 0 {
+		k = 6
+	}
+	queryK := k * 2 // overshoot since we re-sort by time
+	if queryK > e.findingsColl.Count() {
+		queryK = e.findingsColl.Count()
+	}
+	q := fmt.Sprintf("recon findings for %s recent observations", target)
+	res, err := e.findingsColl.Query(ctx, q, queryK,
+		map[string]string{"target": target}, nil)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Finding, 0, len(res))
+	for _, r := range res {
+		f := Finding{
+			ID:     r.ID,
+			Target: r.Metadata["target"],
+			Tool:   r.Metadata["tool"],
+			RunID:  r.Metadata["run_id"],
+			Args:   r.Metadata["args"],
+			Status: r.Metadata["status"],
+			Output: r.Content,
+		}
+		if t, err := time.Parse(time.RFC3339Nano, r.Metadata["timestamp"]); err == nil {
+			f.Timestamp = t
+		}
+		fmt.Sscanf(r.Metadata["step"], "%d", &f.Step)
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Timestamp.After(out[j].Timestamp)
+	})
+	if len(out) > k {
+		out = out[:k]
+	}
+	return out, nil
+}
+
+// FindingsCount returns the total findings persisted (0 if disabled).
+func (e *Engine) FindingsCount() int {
+	if e.findingsColl == nil {
+		return 0
+	}
+	return e.findingsColl.Count()
+}
 
 func loadPlaybookChunks() ([]chromem.Document, error) {
 	if PlaybookFS == nil {
@@ -153,10 +348,10 @@ type chunk struct {
 func chunkMarkdownByH2(md string) []chunk {
 	lines := strings.Split(md, "\n")
 	var (
-		out      []chunk
-		curSec   = "preamble"
-		curBody  strings.Builder
-		flush    = func() {
+		out     []chunk
+		curSec  = "preamble"
+		curBody strings.Builder
+		flush   = func() {
 			body := strings.TrimSpace(curBody.String())
 			if body != "" {
 				out = append(out, chunk{section: curSec, body: body})
@@ -175,6 +370,17 @@ func chunkMarkdownByH2(md string) []chunk {
 	}
 	flush()
 	return out
+}
+
+// sanitizeLabel makes an embedder label safe to use as a directory name.
+func sanitizeLabel(s string) string {
+	r := strings.NewReplacer(
+		":", "_",
+		"/", "_",
+		"\\", "_",
+		" ", "_",
+	)
+	return r.Replace(s)
 }
 
 // ---------- embedder selection ----------
@@ -204,7 +410,6 @@ func ollamaEmbedder() (chromem.EmbeddingFunc, string, error) {
 	if model == "" {
 		model = "nomic-embed-text"
 	}
-	// chromem-go's Ollama embedder appends /api at call time; pass base URL.
 	baseAPI := strings.TrimSuffix(host, "/") + "/api"
 	return chromem.NewEmbeddingFuncOllama(model, baseAPI), fmt.Sprintf("ollama:%s", model), nil
 }
