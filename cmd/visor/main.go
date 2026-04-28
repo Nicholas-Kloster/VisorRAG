@@ -43,6 +43,8 @@ func main() {
 		stateDir       string
 		ephemeral      bool
 		manual         bool
+		cortex         bool
+		cortexDir      string
 	)
 
 	root := &cobra.Command{
@@ -91,14 +93,24 @@ func main() {
 				approver = newStdinApprover(os.Stdin, os.Stderr)
 				fmt.Fprintln(os.Stderr, "visor: --manual gate active. y=approve, n=reject, anything else=reject with that text as guidance to the agent.")
 			}
+			cortexCfg := agent.CortexConfig{Enabled: cortex, FrameworkPath: cortexDir}
+			if cortex {
+				if err := cortexCfg.Resolve(resolvedStateDir); err != nil {
+					return fmt.Errorf("cortex: %w", err)
+				}
+				fmt.Fprintf(os.Stderr, "visor: cortex postprocessor enabled. framework=%s out=%s\n",
+					cortexCfg.FrameworkPath, cortexCfg.OutputDir)
+			}
+
 			eng := agent.New(agent.Config{
 				Model:    model,
 				RAG:      ragEngine,
 				Tools:    reg,
 				MaxSteps: maxSteps,
 				Approve:  approver,
+				Cortex:   cortexCfg,
 				OnEvent: func(e agent.Event) {
-					if quiet && e.Type != "final" && e.Type != "error" {
+					if quiet && e.Type != "final" && e.Type != "error" && e.Type != "cortex" {
 						return
 					}
 					_ = enc.Encode(e)
@@ -123,6 +135,8 @@ func main() {
 	root.Flags().StringVar(&stateDir, "state-dir", "", "directory for persisted findings (default ~/.visor-rag/state)")
 	root.Flags().BoolVar(&ephemeral, "ephemeral", false, "disable findings persistence for this run")
 	root.Flags().BoolVar(&manual, "manual", false, "interactively approve every tool invocation (y/n/<reason text>)")
+	root.Flags().BoolVar(&cortex, "cortex", false, "after the recon loop, draft a Cortex authorization-context artifact and run analyzer.py")
+	root.Flags().StringVar(&cortexDir, "cortex-dir", "", "path to cortex-framework checkout (default $VISORRAG_CORTEX_DIR or ~/cortex-framework)")
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "visor:", err)

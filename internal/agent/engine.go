@@ -85,6 +85,7 @@ type Engine struct {
 	maxSteps int
 	emit     func(Event)
 	approve  Approver
+	cortex   CortexConfig
 }
 
 type Config struct {
@@ -95,6 +96,10 @@ type Config struct {
 	OnEvent  func(Event)
 	// Approve, if non-nil, gates every tool invocation. Nil = auto-approve.
 	Approve Approver
+	// Cortex (when Enabled) drafts a structured authorization-context
+	// artifact after the ReAct loop terminates and runs analyzer.py to
+	// produce JSON + report outputs.
+	Cortex CortexConfig
 }
 
 func New(cfg Config) *Engine {
@@ -111,6 +116,7 @@ func New(cfg Config) *Engine {
 		maxSteps: cfg.MaxSteps,
 		emit:     cfg.OnEvent,
 		approve:  cfg.Approve,
+		cortex:   cfg.Cortex,
 	}
 }
 
@@ -193,6 +199,9 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 		// No tool calls → terminal turn.
 		if len(resp.ToolCalls) == 0 {
 			e.emit(Event{Time: time.Now(), Type: "final", Step: step, RunID: runID, Message: resp.Text})
+			if err := e.generateCortexArtifact(ctx, target, runID, history); err != nil {
+				e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "cortex: " + err.Error()})
+			}
 			return resp.Text, nil
 		}
 
@@ -272,6 +281,9 @@ func (e *Engine) Run(ctx context.Context, target string) (string, error) {
 	}
 
 	e.emit(Event{Time: time.Now(), Type: "final", Step: step, RunID: runID, Message: "step budget exhausted"})
+	if err := e.generateCortexArtifact(ctx, target, runID, history); err != nil {
+		e.emit(Event{Time: time.Now(), Type: "error", Step: step, RunID: runID, Message: "cortex: " + err.Error()})
+	}
 	return "step budget exhausted before agent finished", nil
 }
 
