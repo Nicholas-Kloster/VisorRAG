@@ -14,7 +14,15 @@ import (
 	"github.com/Nicholas-Kloster/visor-rag/internal/rag"
 )
 
-//go:embed *.md
+// Embed top-level playbooks (cloud/web/api/ai-ml.md) plus the entire
+// ai-osint/ subdirectory (curated catalogue from
+// github.com/Nicholas-Kloster/AI-LLM-Infrastructure-OSINT — Shodan queries
+// and service fingerprints for AI/ML infra). The RAG WalkDir picks up
+// nested .md files automatically; the diversified Search now ensures
+// per-source coverage so AI-LLM-OSINT chunks don't crowd out general
+// playbooks for non-AI targets.
+//
+//go:embed *.md ai-osint
 var fsRoot embed.FS
 
 func init() {

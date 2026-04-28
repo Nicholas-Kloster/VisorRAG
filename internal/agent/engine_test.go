@@ -731,6 +731,49 @@ func TestManualGateRejectedFindingPersisted(t *testing.T) {
 	}
 }
 
+// TestRAGSearchSurfacesAIOSINT: AI/ML-specific queries should surface
+// chunks from the AI-LLM-OSINT catalogue embedded under playbooks/ai-osint/.
+// Confirms (a) the embed pattern actually picked up the subdir,
+// (b) retrieval reaches the new corpus, (c) playbook discovery is automatic.
+func TestRAGSearchSurfacesAIOSINT(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	rg := mustRAG(t)
+	if rg.Count() < 20 {
+		t.Errorf("expected ≥20 chunks after AI-OSINT integration, got %d", rg.Count())
+	}
+
+	// AI-specific query should include at least one ai-osint source in
+	// the top-8.
+	hits, err := rg.Search(ctx, "vLLM model server inference endpoint exposed", 8)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	var sawAIOSINT bool
+	for _, h := range hits {
+		// embed.FS preserves the directory structure in the path metadata
+		// recorded as 'source' — chunks from playbooks/ai-osint/ will have
+		// the bare filename (e.g. "03-model-serving.md") since rag stores
+		// just filepath.Base. We mark them implicitly: AI-OSINT files have
+		// numeric-prefix or "ports"/"terminology" names that don't collide
+		// with the 4 top-level playbooks.
+		switch h.Source {
+		case "ai-ml.md", "cloud.md", "web.md", "api.md":
+			// top-level
+		default:
+			sawAIOSINT = true
+		}
+	}
+	if !sawAIOSINT {
+		var names []string
+		for _, h := range hits {
+			names = append(names, h.Source)
+		}
+		t.Errorf("AI-specific query didn't surface any AI-OSINT chunks; sources=%v", names)
+	}
+}
+
 // TestRAGSearchDiversifiedAcrossSources: with 4 markdown playbooks in the
 // corpus and k=4, the result must contain at least 4 distinct source files.
 // Earlier the AI/ML playbook dominated the top-4 because of vocabulary
