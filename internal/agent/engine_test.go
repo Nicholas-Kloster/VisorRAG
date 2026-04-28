@@ -731,6 +731,40 @@ func TestManualGateRejectedFindingPersisted(t *testing.T) {
 	}
 }
 
+// TestHasMeaningfulObservations: cortex should skip empty-result runs
+// to avoid confabulated artifacts. Surfaced from run #17 against
+// 185.116.97.167 (fully remediated post-disclosure) — model invented
+// "violations" like "Assumes right to remain unexposed" when fed an
+// empty visorgraph graph and an empty aimap port list.
+func TestHasMeaningfulObservations(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		hist []Message
+		want bool
+	}{
+		{"empty history", nil, false},
+		{"only errors", []Message{{Role: RoleTool, Content: "ERROR: unknown tool"}}, false},
+		{"only rejections", []Message{{Role: RoleTool, Content: "User rejected tool execution. Reason: fragile target"}}, false},
+		{"empty visorgraph graph", []Message{{Role: RoleTool, Content: `{"nodes":{},"edges":{},"created_at":1.7e9}`}}, false},
+		{"empty aimap report", []Message{{Role: RoleTool, Content: `{"open_ports":[],"services":null,"summary":{"open_ports":0}}`}}, false},
+		{"real visorgraph hit", []Message{{Role: RoleTool, Content: `{"nodes":{"x":{"type":"service","attrs":{"port":80,"http_status":200}}}}`}}, true},
+		{"real aimap hit", []Message{{Role: RoleTool, Content: `{"open_ports":[{"host":"x","port":80,"open":true,"server":"Apache"}]}`}}, true},
+		{"BARE ranking output", []Message{{Role: RoleTool, Content: `{"findings":[{"matches":[{"rank":1,"category":"auxiliary"}]}]}`}}, true},
+		{"mixed (one real among empty)", []Message{
+			{Role: RoleTool, Content: `{"nodes":{},"edges":{}}`},
+			{Role: RoleTool, Content: `{"open_ports":[{"port":80,"server":"nginx"}]}`},
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasMeaningfulObservations(tc.hist); got != tc.want {
+				t.Errorf("hasMeaningfulObservations(%q) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRAGSearchSurfacesAIOSINT: AI/ML-specific queries should surface
 // chunks from the AI-LLM-OSINT catalogue embedded under playbooks/ai-osint/.
 // Confirms (a) the embed pattern actually picked up the subdir,

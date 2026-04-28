@@ -61,6 +61,21 @@ func (e *Engine) generateCortexArtifact(ctx context.Context, target, runID strin
 		return nil
 	}
 
+	// If the run produced no successful observations (target unresponsive,
+	// firewalled, fully remediated), skip the analysis. Earlier behavior
+	// asked the LLM to draft an artifact from empty input, which produced
+	// confabulated "violations" like "assumes right to remain unexposed"
+	// — nonsense for a target with no exposed surface.
+	if !hasMeaningfulObservations(history) {
+		e.emit(Event{
+			Time:    time.Now(),
+			Type:    "cortex",
+			RunID:   runID,
+			Message: "skipped — no meaningful observations to analyze (target appears unresponsive or fully remediated)",
+		})
+		return nil
+	}
+
 	// Load only the format example. Earlier we also sent framework.md but
 	// at ~23KB it pushed CPU-bound local models past their HTTP timeout.
 	// The format requirements in buildCortexSystemPrompt + one example are
@@ -164,6 +179,53 @@ func buildCortexUserPrompt(target string, history []Message) string {
 	}
 	sb.WriteString("\nDraft the Cortex analysis now.")
 	return sb.String()
+}
+
+// hasMeaningfulObservations returns true if the history contains at least
+// one tool result that contains an exposure signal — a port, a server
+// header, a title, an open-state flag, etc. Empty graphs (visorgraph
+// returns {"nodes":{},"edges":{}} when nothing is exposed), aimap returns
+// "no open ports", error strings, and rejection strings all fail this
+// check, so Cortex skips the draft turn for genuinely-empty runs and
+// avoids the confabulated "violations" we saw on run #17 (185.116.97.167,
+// fully remediated post-disclosure).
+//
+// The indicator list is empirical for our current toolset (visorgraph,
+// aimap, menlohunt, BARE). When new tools land, add their structural
+// signal markers here.
+func hasMeaningfulObservations(history []Message) bool {
+	indicators := []string{
+		`"open":true`, `"open": true`, // aimap open-port flag
+		`"port":`,         // any tool reporting a port number in JSON
+		`"server":`,       // HTTP server header from any HTTP probe
+		`"title":`,        // HTTP page title
+		`"http_status"`,   // visorgraph HTTP probe attrs
+		`"service":`,      // visorgraph service classification
+		`"exposure":`,     // visorgraph exposure tagging
+		`"matches"`,       // BARE module rankings
+		`"category":`,     // BARE module category
+		`"banner":`,       // raw-protocol banner from menlohunt
+		`"finding":`,      // menlohunt severity finding
+		`"severity":`,     // anything with a severity field
+		`"product":`,      // menlohunt product detection
+		`"cert":`,         // TLS cert SAN material
+	}
+	for _, m := range history {
+		if m.Role != RoleTool {
+			continue
+		}
+		body := m.Content
+		if strings.HasPrefix(strings.TrimSpace(body), "ERROR:") ||
+			strings.HasPrefix(strings.TrimSpace(body), "User rejected") {
+			continue
+		}
+		for _, ind := range indicators {
+			if strings.Contains(body, ind) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // extractMarkdown strips fenced code blocks the LLM may have wrapped
