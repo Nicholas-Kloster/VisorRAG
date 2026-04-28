@@ -175,13 +175,22 @@ func (a *asnmapTool) Run(ctx context.Context, jsonArgs string) (string, error) {
 
 type naabuArgs struct {
 	Target string `json:"target"`
-	Top    int    `json:"top,omitempty"`
+	// Ports accepts any of:
+	//   "80,443"          → explicit list      → -port 80,443
+	//   "1-1000"          → explicit range     → -port 1-1000
+	//   "top-100"|"100"   → top-100 preset     → -top-ports 100
+	//   "top-1000"|"1000" → top-1000 preset    → -top-ports 1000
+	//   "full"|"top-full" → all 65k ports      → -top-ports full
+	//   ""                → default top-100
+	Ports string `json:"ports,omitempty"`
 }
 type naabuTool struct{ exec *sandbox.Executor }
 
-func (n *naabuTool) Name() string         { return "naabu" }
-func (n *naabuTool) Description() string  { return "TCP port scanner. Use small top-N for quick recon." }
-func (n *naabuTool) ArgsSchema() string   { return `{"target":"<ip|host>","top":100}` }
+func (n *naabuTool) Name() string        { return "naabu" }
+func (n *naabuTool) Description() string { return "TCP port scanner. Default top-100 for fast recon; pass explicit list/range for targeted sweeps." }
+func (n *naabuTool) ArgsSchema() string {
+	return `{"target":"<ip|host>","ports":"<spec: 80,443 or 1-1000 or top-100|top-1000|full; default top-100>"}`
+}
 func (n *naabuTool) Run(ctx context.Context, jsonArgs string) (string, error) {
 	var a naabuArgs
 	if err := json.Unmarshal([]byte(jsonArgs), &a); err != nil {
@@ -190,17 +199,29 @@ func (n *naabuTool) Run(ctx context.Context, jsonArgs string) (string, error) {
 	if a.Target == "" {
 		return "", fmt.Errorf("target required")
 	}
-	if a.Top <= 0 {
-		a.Top = 100
-	}
-	args := []string{
-		"-host", a.Target,
-		"-top-ports", fmt.Sprintf("%d", a.Top),
-		"-silent",
-		"-json",
-		"-no-color",
-	}
+	args := []string{"-host", a.Target}
+	args = append(args, naabuPortFlag(a.Ports)...)
+	args = append(args, "-silent", "-json", "-no-color")
 	return runAndFormat(ctx, n.exec, "naabu", args, 90*time.Second)
+}
+
+// naabuPortFlag maps a free-form ports spec to naabu CLI flags.
+// Naabu's -top-ports only accepts the preset values {100, 1000, full};
+// arbitrary numeric values must go through -port. Earlier the wrapper
+// passed any int directly to -top-ports, which broke when llama-3.3
+// asked for top: 10 (run #6, commit d1b630a era).
+func naabuPortFlag(spec string) []string {
+	spec = strings.TrimSpace(strings.ToLower(spec))
+	switch spec {
+	case "", "top-100", "100":
+		return []string{"-top-ports", "100"}
+	case "top-1000", "1000":
+		return []string{"-top-ports", "1000"}
+	case "full", "top-full":
+		return []string{"-top-ports", "full"}
+	}
+	// Anything else: treat as explicit port list/range (e.g. "80,443" or "1-65535").
+	return []string{"-port", spec}
 }
 
 // ---------- shared exec helper ----------
