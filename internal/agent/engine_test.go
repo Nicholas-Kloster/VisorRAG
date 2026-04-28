@@ -731,6 +731,32 @@ func TestManualGateRejectedFindingPersisted(t *testing.T) {
 	}
 }
 
+// TestRAGSearchDiversifiedAcrossSources: with 4 markdown playbooks in the
+// corpus and k=4, the result must contain at least 4 distinct source files.
+// Earlier the AI/ML playbook dominated the top-4 because of vocabulary
+// overlap with the hardcoded retrieve query "recon enumeration playbook" —
+// agent saw 2x ai-ml.md hits even when target was a plain web server.
+func TestRAGSearchDiversifiedAcrossSources(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	rg := mustRAG(t)
+	hits, err := rg.Search(ctx, "scanme.nmap.org recon enumeration playbook", 4)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) < 4 {
+		t.Fatalf("expected 4 hits, got %d", len(hits))
+	}
+	sources := map[string]bool{}
+	for _, h := range hits {
+		sources[h.Source] = true
+	}
+	if len(sources) < 4 {
+		t.Errorf("expected ≥4 distinct sources, got %d (%v)", len(sources), sources)
+	}
+}
+
 // TestSchemaHintTypeInference: hint values with different JSON types must
 // produce schemas with matching JSON-Schema types. A regression of the
 // "everything is a string" bug bit us on the first live Groq run because

@@ -175,7 +175,17 @@ func (e *Engine) HasPersistence() bool { return e.findingsColl != nil }
 // FindingsDir returns the on-disk findings path, or "" if persistence is off.
 func (e *Engine) FindingsDir() string { return e.findingsDir }
 
-// Search returns up to k playbook chunks most relevant to query.
+// Search returns up to k playbook chunks most relevant to query, diversified
+// across source files. Strategy: take the best single match, then for each
+// distinct source file in the corpus take its top match (deduped against
+// what we already have). This guarantees the agent sees one chunk from each
+// playbook rather than 4-from-the-same-vocabulary-winner — important when
+// playbook vocabularies overlap (e.g., "recon enumeration" matches AI/ML's
+// tooling-order section regardless of target type).
+//
+// Diversification preserves similarity ranking within each source: the
+// chunk we take from cloud.md is cloud.md's BEST match for the query, not
+// a random cloud.md chunk.
 func (e *Engine) Search(ctx context.Context, query string, k int) ([]Hit, error) {
 	if k <= 0 {
 		k = 4
@@ -183,15 +193,67 @@ func (e *Engine) Search(ctx context.Context, query string, k int) ([]Hit, error)
 	if e.playbookColl.Count() == 0 {
 		return nil, nil
 	}
-	if k > e.playbookColl.Count() {
-		k = e.playbookColl.Count()
+
+	// Discover distinct source files. Cheap: query large-N once, dedupe by source.
+	wide := e.playbookColl.Count()
+	if wide > 32 {
+		wide = 32
 	}
-	res, err := e.playbookColl.Query(ctx, query, k, nil, nil)
+	all, err := e.playbookColl.Query(ctx, query, wide, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	hits := make([]Hit, 0, len(res))
-	for _, r := range res {
+
+	seen := map[string]bool{}
+	hits := make([]Hit, 0, k)
+
+	// Pass 1: take overall top-1 (best similarity, regardless of source)
+	if len(all) > 0 {
+		r := all[0]
+		hits = append(hits, Hit{
+			Source:     r.Metadata["source"],
+			Section:    r.Metadata["section"],
+			Content:    r.Content,
+			Similarity: r.Similarity,
+		})
+		seen[r.Metadata["source"]] = true
+	}
+
+	// Pass 2: walk the rest in similarity order, take top-1 per new source
+	for _, r := range all[1:] {
+		if len(hits) >= k {
+			break
+		}
+		src := r.Metadata["source"]
+		if seen[src] {
+			continue
+		}
+		hits = append(hits, Hit{
+			Source:     src,
+			Section:    r.Metadata["section"],
+			Content:    r.Content,
+			Similarity: r.Similarity,
+		})
+		seen[src] = true
+	}
+
+	// Pass 3: if k > distinct sources, fill the remaining slots from the
+	// query results in order, allowing source repeats. Caller asked for k
+	// hits; we return up to k.
+	for _, r := range all {
+		if len(hits) >= k {
+			break
+		}
+		alreadyAt := false
+		for _, h := range hits {
+			if h.Source == r.Metadata["source"] && h.Section == r.Metadata["section"] {
+				alreadyAt = true
+				break
+			}
+		}
+		if alreadyAt {
+			continue
+		}
 		hits = append(hits, Hit{
 			Source:     r.Metadata["source"],
 			Section:    r.Metadata["section"],
@@ -199,6 +261,7 @@ func (e *Engine) Search(ctx context.Context, query string, k int) ([]Hit, error)
 			Similarity: r.Similarity,
 		})
 	}
+
 	return hits, nil
 }
 
