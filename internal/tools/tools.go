@@ -32,17 +32,29 @@ type Registry struct {
 }
 
 func NewRegistry(exec *sandbox.Executor) *Registry {
-	r := &Registry{exec: exec, tools: map[string]Tool{}}
-	r.register(&httpxTool{exec: exec})
-	r.register(&nucleiTool{exec: exec})
-	r.register(&asnmapTool{exec: exec})
-	r.register(&naabuTool{exec: exec})
+	r := NewEmpty()
+	r.exec = exec
+	r.Register(&httpxTool{exec: exec})
+	r.Register(&nucleiTool{exec: exec})
+	r.Register(&asnmapTool{exec: exec})
+	r.Register(&naabuTool{exec: exec})
 	return r
 }
 
-func (r *Registry) register(t Tool) {
+// NewEmpty constructs a registry with no tools wired. Useful for tests
+// that supply their own Tool implementations, or for callers extending the
+// default toolset before Engine construction.
+func NewEmpty() *Registry {
+	return &Registry{tools: map[string]Tool{}}
+}
+
+// Register adds a Tool to the registry. Names must be unique; later
+// registrations overwrite earlier ones.
+func (r *Registry) Register(t Tool) {
+	if _, exists := r.tools[t.Name()]; !exists {
+		r.order = append(r.order, t.Name())
+	}
 	r.tools[t.Name()] = t
-	r.order = append(r.order, t.Name())
 }
 
 func (r *Registry) Get(name string) (Tool, bool) { t, ok := r.tools[name]; return t, ok }

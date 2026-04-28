@@ -49,13 +49,19 @@ func New(ctx context.Context) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("select embedder: %w", err)
 	}
+	return NewWithEmbedder(ctx, embedFn, label)
+}
 
+// NewWithEmbedder builds an Engine with a caller-supplied embedding func.
+// Used by tests to swap in a deterministic in-process embedder, and by
+// callers that want to wire a custom embedding backend without going
+// through environment variables.
+func NewWithEmbedder(ctx context.Context, embedFn chromem.EmbeddingFunc, label string) (*Engine, error) {
 	db := chromem.NewDB()
 	coll, err := db.CreateCollection(collectionName, map[string]string{"embedder": label}, embedFn)
 	if err != nil {
 		return nil, fmt.Errorf("create collection: %w", err)
 	}
-
 	docs, err := loadPlaybookChunks()
 	if err != nil {
 		return nil, fmt.Errorf("load playbooks: %w", err)
@@ -66,7 +72,6 @@ func New(ctx context.Context) (*Engine, error) {
 	if err := coll.AddDocuments(ctx, docs, 4); err != nil {
 		return nil, fmt.Errorf("ingest playbooks: %w", err)
 	}
-
 	return &Engine{db: db, coll: coll}, nil
 }
 
