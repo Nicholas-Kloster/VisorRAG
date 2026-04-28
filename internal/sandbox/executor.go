@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/Nicholas-Kloster/visor-rag/internal/sandbox/runsc"
@@ -37,8 +38,14 @@ func New(timeout time.Duration) (*Executor, error) {
 // Execute runs cmd with args inside a gVisor sandbox. cmd is resolved on the
 // host via $PATH and bind-mounted read-only inside the container.
 func (e *Executor) Execute(ctx context.Context, cmd string, args ...string) (*Result, error) {
+	return e.ExecuteStdin(ctx, nil, cmd, args...)
+}
+
+// ExecuteStdin is Execute plus a piped stdin. Used by tools like BARE that
+// read findings JSON from stdin. Pass nil stdin for normal invocation.
+func (e *Executor) ExecuteStdin(ctx context.Context, stdin io.Reader, cmd string, args ...string) (*Result, error) {
 	full := append([]string{cmd}, args...)
-	r, err := runsc.RunSandboxed(ctx, e.runscPath, full, e.timeout)
+	r, err := runsc.RunSandboxed(ctx, e.runscPath, full, e.timeout, stdin)
 	if err != nil {
 		return nil, err
 	}

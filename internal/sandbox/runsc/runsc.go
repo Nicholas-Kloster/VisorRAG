@@ -14,11 +14,13 @@
 package runsc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,8 +69,10 @@ func IsAvailable() bool {
 
 // RunSandboxed executes cmd inside a gVisor container. cmd[0] is resolved via
 // exec.LookPath; cmd[1:] are passed as arguments to the bind-mounted binary at
-// /rg-probe inside the container.
-func RunSandboxed(ctx context.Context, runscPath string, cmd []string, timeout time.Duration) (*ExecResult, error) {
+// /rg-probe inside the container. stdin (if non-nil) is piped to the
+// container init process — used by tools like BARE that read findings
+// JSON from stdin.
+func RunSandboxed(ctx context.Context, runscPath string, cmd []string, timeout time.Duration, stdin io.Reader) (*ExecResult, error) {
 	if len(cmd) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -110,19 +114,26 @@ func RunSandboxed(ctx context.Context, runscPath string, cmd []string, timeout t
 		cid,
 	)
 
+	var stdoutBuf, stderrBuf bytes.Buffer
+	runscCmd.Stdout = &stdoutBuf
+	runscCmd.Stderr = &stderrBuf
+	if stdin != nil {
+		runscCmd.Stdin = stdin
+	}
+
 	start := time.Now()
-	stdout, err := runscCmd.Output()
+	err = runscCmd.Run()
 	dur := time.Since(start)
 
 	res := &ExecResult{
 		ContainerID: cid,
-		Stdout:      stdout,
+		Stdout:      stdoutBuf.Bytes(),
+		Stderr:      stderrBuf.Bytes(),
 		Duration:    dur,
 	}
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			res.ExitCode = ee.ExitCode()
-			res.Stderr = ee.Stderr
 		} else {
 			return nil, fmt.Errorf("runsc: %w", err)
 		}

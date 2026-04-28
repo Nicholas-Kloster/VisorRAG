@@ -13,6 +13,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -48,15 +49,21 @@ type Registry struct {
 //     servers, agent platforms — 36 service fingerprints).
 //   - menlohunt:  GCP External Attack Surface Management (5-phase scan with
 //     attack chain detection). Reach when target signals Google Cloud.
+//   - bare:       post-recon exploit ranking. Takes finding descriptions,
+//     returns ranked Metasploit modules via embedded BERT semantic search
+//     against a 3,904-module corpus. Use after recon tools have produced
+//     concrete findings.
 //
-// All three are Go static binaries authored under the NuClide umbrella;
-// all three produce dense JSON observations the agent can reason over.
+// All four are NuClide-authored binaries. visorgraph/aimap/menlohunt are
+// Go static; bare is Rust. All produce structured JSON the agent can
+// reason over.
 func NewRegistry(exec *sandbox.Executor) *Registry {
 	r := NewEmpty()
 	r.exec = exec
 	r.Register(&visorgraphTool{exec: exec})
 	r.Register(&aimapTool{exec: exec})
 	r.Register(&menlohuntTool{exec: exec})
+	r.Register(&bareTool{exec: exec})
 	return r
 }
 
@@ -202,6 +209,97 @@ func (m *menlohuntTool) Run(ctx context.Context, jsonArgs string) (string, error
 		args = append(args, "-no-icmp")
 	}
 	return runAndFormat(ctx, m.exec, "menlohunt", args, 90*time.Second)
+}
+
+// ---------- bare (NuClide exploit ranking) ----------
+
+type bareArgs struct {
+	Findings []bareFinding `json:"findings"`
+	Top      int           `json:"top,omitempty"` // top-N modules per finding (default 3)
+}
+
+type bareFinding struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Target      string `json:"target,omitempty"`
+	Severity    string `json:"severity,omitempty"`
+}
+
+// bareInput is the BARE v1 envelope schema (see INPUT_FORMAT.md in the BARE repo).
+type bareInput struct {
+	Version  int               `json:"version"`
+	Source   string            `json:"source"`
+	Findings []bareInputFinding `json:"findings"`
+}
+
+type bareInputFinding struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Target      string `json:"target,omitempty"`
+	Severity    string `json:"severity,omitempty"`
+}
+
+type bareTool struct{ exec *sandbox.Executor }
+
+func (b *bareTool) Name() string { return "bare" }
+func (b *bareTool) Description() string {
+	return "Post-recon exploit ranking via embedded BERT semantic search. Provide a list of findings (title + description text); BARE returns the top-N most relevant Metasploit modules per finding from its 3,904-module corpus. Reach AFTER recon tools (visorgraph/aimap/menlohunt) have produced concrete findings — not as a primary recon step."
+}
+func (b *bareTool) ArgsSchema() string {
+	return `{"findings":[{"title":"<short name>","description":"<rich text — what the vuln is, what's affected, how it's exploited>","target":"<optional>","severity":"<info|low|medium|high|critical, optional>"}],"top":3}`
+}
+func (b *bareTool) Run(ctx context.Context, jsonArgs string) (string, error) {
+	var a bareArgs
+	if err := json.Unmarshal([]byte(jsonArgs), &a); err != nil {
+		return "", fmt.Errorf("parse args: %w", err)
+	}
+	if len(a.Findings) == 0 {
+		return "", fmt.Errorf("findings required (at least one)")
+	}
+
+	// Build the BARE v1 input envelope.
+	input := bareInput{
+		Version:  1,
+		Source:   "visor-rag",
+		Findings: make([]bareInputFinding, 0, len(a.Findings)),
+	}
+	for i, f := range a.Findings {
+		if strings.TrimSpace(f.Description) == "" {
+			return "", fmt.Errorf("finding %d: description required", i)
+		}
+		input.Findings = append(input.Findings, bareInputFinding{
+			ID:          fmt.Sprintf("vrf-%d", i+1),
+			Title:       f.Title,
+			Description: f.Description,
+			Target:      f.Target,
+			Severity:    f.Severity,
+		})
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("encode bare input: %w", err)
+	}
+
+	cmdArgs := []string{}
+	if a.Top > 0 {
+		cmdArgs = append(cmdArgs, "--top", fmt.Sprintf("%d", a.Top))
+	}
+
+	subCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	r, err := b.exec.ExecuteStdin(subCtx, bytes.NewReader(payload), "bare", cmdArgs...)
+	if err != nil {
+		return "", fmt.Errorf("sandboxed bare: %w", err)
+	}
+	out := strings.TrimSpace(r.Stdout)
+	if out == "" && r.Stderr != "" {
+		out = "(no stdout) stderr: " + strings.TrimSpace(r.Stderr)
+	}
+	if out == "" {
+		out = fmt.Sprintf("(empty result; exit=%d duration=%s)", r.ExitCode, r.Duration)
+	}
+	return out, nil
 }
 
 // ---------- httpx (DEPRECATED — not registered by default) ----------
