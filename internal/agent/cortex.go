@@ -61,15 +61,15 @@ func (e *Engine) generateCortexArtifact(ctx context.Context, target, runID strin
 		return nil
 	}
 
-	// Load methodology + one example for format anchoring.
-	framework, err := os.ReadFile(filepath.Join(e.cortex.FrameworkPath, "framework.md"))
-	if err != nil {
-		return fmt.Errorf("read framework.md: %w", err)
-	}
+	// Load only the format example. Earlier we also sent framework.md but
+	// at ~23KB it pushed CPU-bound local models past their HTTP timeout.
+	// The format requirements in buildCortexSystemPrompt + one example are
+	// enough to anchor the output. framework.md remains useful for
+	// human readers; we just don't ship it to the model.
 	examplePath := filepath.Join(e.cortex.FrameworkPath, "examples", "iloveyou.md")
 	example, _ := os.ReadFile(examplePath) // best-effort
 
-	system := buildCortexSystemPrompt(string(framework), string(example))
+	system := buildCortexSystemPrompt(example)
 	user := buildCortexUserPrompt(target, history)
 
 	resp, err := e.model.Generate(ctx, system, []Message{{Role: RoleUser, Content: user}}, nil)
@@ -115,36 +115,32 @@ func (e *Engine) generateCortexArtifact(ctx context.Context, target, runID strin
 	return nil
 }
 
-func buildCortexSystemPrompt(framework, example string) string {
+func buildCortexSystemPrompt(example []byte) string {
 	var sb strings.Builder
 	sb.WriteString(`You are drafting a Cortex authorization-context analysis for the
-target of an authorized security reconnaissance engagement. The
-methodology and reference example below define the format and the
-analytical frame. Apply the methodology to the recon observations the
-user will provide.
+target of an authorized security reconnaissance engagement. Cortex
+describes a system in three parts: what it does (operations are
+neutral), what it took without asking (authorization violations), and
+why those violations matter (context).
 
 OUTPUT REQUIREMENTS:
 - Three sections only: SKELETON, VIOLATIONS, CONTEXT.
-- Each section: H2 heading, then bulleted list. Five to fifteen
-  bullets per section.
-- SKELETON: what the target's exposed services factually do (operations
-  are neutral; describe behavior without judgment).
+- Each section: H2 heading (## SKELETON / ## VIOLATIONS / ## CONTEXT),
+  then a bulleted list. Five to fifteen bullets per section.
+- SKELETON: what the target's exposed services factually do — describe
+  behavior without judgment. "Serves HTTP on port 80 via Apache 2.4.7."
 - VIOLATIONS: authorization gaps the target's exposure assumes — what
   it's taking, exposing, or making available without explicit consent
-  or appropriate scope.
+  or appropriate scope. Phrase as "Assumes right to ..."
 - CONTEXT: why each violation matters. Impact, blast radius, business
   risk, exposure-to-real-users.
-- Output ONLY the markdown. No preamble, no commentary, no fenced
-  code blocks around the output.
-
+- Output ONLY the markdown. Begin with an H1 title line. No preamble,
+  no commentary, no fenced code blocks around the output.
 `)
 
-	sb.WriteString("\n--- METHODOLOGY (cortex-framework framework.md) ---\n\n")
-	sb.WriteString(framework)
-
-	if example != "" {
-		sb.WriteString("\n--- REFERENCE EXAMPLE (format only; subject differs) ---\n\n")
-		sb.WriteString(example)
+	if len(example) > 0 {
+		sb.WriteString("\n--- REFERENCE EXAMPLE (for format only; your subject is different) ---\n\n")
+		sb.Write(example)
 	}
 
 	return sb.String()
