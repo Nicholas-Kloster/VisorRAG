@@ -335,9 +335,97 @@ func TestRAGContextInjected(t *testing.T) {
 	if !strings.Contains(prompt, "RECON CONTEXT") {
 		t.Errorf("prompt missing RECON CONTEXT block: %q", prompt[:min(200, len(prompt))])
 	}
-	if !strings.Contains(prompt, "TOOLS AVAILABLE") {
-		t.Errorf("prompt missing TOOLS AVAILABLE block")
+	// Tool list is now transmitted via function-calling, not in user prompt.
+	// The verbose "TOOLS AVAILABLE" manifest must NOT appear here anymore.
+	if strings.Contains(prompt, "TOOLS AVAILABLE") {
+		t.Errorf("user prompt still contains TOOLS AVAILABLE manifest — should be dropped (tools transmitted via function-calling)")
 	}
+}
+
+// TestPromptIsTrimmed: with 4 retrieved playbook hits, the user prompt
+// should NOT contain the full content of any retrieved chunk. The trim
+// reduces per-turn token usage so a multi-step run fits inside Groq's
+// free-tier 12k TPM ceiling.
+func TestPromptIsTrimmed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	model := newFakeModel("trim", &Response{Text: "ok", StopReason: "end_turn"})
+	eng := New(Config{
+		Model:    model,
+		RAG:      mustRAG(t),
+		Tools:    tools.NewEmpty(),
+		MaxSteps: 1,
+		OnEvent:  func(Event) {},
+	})
+	if _, err := eng.Run(ctx, "aws ec2 cloud target"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	prompt := model.lastHistory()[0].Content
+
+	// Sanity: prompt structure intact.
+	if !strings.Contains(prompt, "playbook one-liners") {
+		t.Errorf("expected one-liner header in prompt, got: %q", prompt[:min(300, len(prompt))])
+	}
+
+	// Pull the actual hits separately and confirm none of their FULL content
+	// appears verbatim in the prompt — only the summarized first line.
+	rg, _ := mustRAGUntyped(t)
+	hits, err := rg.Search(ctx, "aws ec2 cloud target recon enumeration playbook", 4)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	for _, h := range hits {
+		// If the chunk has multiple lines and is longer than the summary cap,
+		// the full content should NOT appear verbatim.
+		if strings.Count(h.Content, "\n") < 2 || len(h.Content) <= 200 {
+			continue // chunk is already short; no leakage to detect
+		}
+		if strings.Contains(prompt, h.Content) {
+			t.Errorf("full chunk leaked into trimmed prompt: %s :: %s", h.Source, h.Section)
+		}
+	}
+
+	// Hard ceiling sanity: with 4 hits and no prior findings, the body of
+	// the prompt should be well under 1500 chars (~375 tokens).
+	if len(prompt) > 1500 {
+		t.Errorf("trimmed prompt is %d chars, expected <1500", len(prompt))
+	}
+}
+
+// TestSummarizeChunk: covers the edge cases of the one-line summarizer.
+func TestSummarizeChunk(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		in    string
+		max   int
+		want  string
+	}{
+		{"plain first line", "First sentence here.\nSecond sentence.", 100, "First sentence here."},
+		{"strips bullet", "- bullet item one\n- bullet item two", 100, "bullet item one"},
+		{"strips numbered", "1. step one\n2. step two", 100, "step one"},
+		{"truncates long", strings.Repeat("a", 250), 100, strings.Repeat("a", 100) + "…"},
+		{"skips blank", "\n\n   \nactual content here", 100, "actual content here"},
+		{"empty input", "", 100, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := summarizeChunk(tc.in, tc.max)
+			if got != tc.want {
+				t.Errorf("summarizeChunk(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+			}
+		})
+	}
+}
+
+// mustRAGUntyped returns the RAG engine + nil error for use in helper
+// chains where we want a separate engine instance.
+func mustRAGUntyped(t *testing.T) (*rag.Engine, error) {
+	t.Helper()
+	r, err := rag.NewWithEmbedder(context.Background(), fakeEmbedder, "fake-bag-of-words")
+	return r, err
 }
 
 // TestEventTimingSane: emitted events should have monotonically
