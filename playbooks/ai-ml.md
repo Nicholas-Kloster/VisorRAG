@@ -54,8 +54,9 @@ nuclei when AI/ML signals are present.
   names, model names, sometimes data paths
 
 ## Tooling order
-1. aimap-profile — classify the target (research / commercial / personal)
-   before any active probe
-2. aimap — fingerprint + deep enumeration
-3. httpx — supplementary surface coverage
-4. nuclei with custom AI-specific templates
+1. aimap — fingerprint + deep enumeration of AI/ML services (LLM endpoints,
+   vector DBs, model servers, agent platforms). Default port set is built
+   for this surface. Reach first when AI/ML signals are present.
+2. visorgraph — supplementary surface coverage: CT logs may reveal the
+   provider's other AI subdomains, TLS cert SANs may name the tenant, HTTP
+   fingerprint catches non-AI services on the same host.

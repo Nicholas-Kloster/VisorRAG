@@ -2,12 +2,21 @@
 // Every wrapper shells out to a CLI binary inside the gVisor sandbox so
 // the agent process (which holds API keys, RAG memory, and decision state)
 // is fully isolated from probe execution.
+//
+// The default registry exposes NuClide-authored tools (visorgraph, aimap)
+// rather than commodity scanners. ProjectDiscovery wrappers (httpxTool,
+// nucleiTool, asnmapTool, naabuTool) remain defined below for ad-hoc
+// registration but are NOT in the default lineup — they were dropped after
+// 7 live runs against scanme.nmap.org surfaced PDCP auth walls, template
+// directories, top-port preset rejections, and Python venv name conflicts
+// that NuClide tools sidestep by design.
 package tools
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -31,13 +40,16 @@ type Registry struct {
 	order []string
 }
 
+// NewRegistry builds the default NuClide tool lineup. visorgraph is the
+// general-purpose recon engine (CT logs + HTTP + TLS + exposure
+// classification). aimap is the AI/ML-specific scanner. Both are Go static
+// binaries authored under the NuClide umbrella; both produce dense JSON
+// observations the agent can reason over directly.
 func NewRegistry(exec *sandbox.Executor) *Registry {
 	r := NewEmpty()
 	r.exec = exec
-	r.Register(&httpxTool{exec: exec})
-	r.Register(&nucleiTool{exec: exec})
-	r.Register(&asnmapTool{exec: exec})
-	r.Register(&naabuTool{exec: exec})
+	r.Register(&visorgraphTool{exec: exec})
+	r.Register(&aimapTool{exec: exec})
 	return r
 }
 
@@ -70,7 +82,78 @@ func (r *Registry) Manifest() string {
 	return sb.String()
 }
 
-// ---------- httpx ----------
+// ---------- visorgraph (NuClide recon engine) ----------
+
+type visorgraphArgs struct {
+	Target   string `json:"target"`
+	NoActive bool   `json:"no_active,omitempty"`
+}
+type visorgraphTool struct{ exec *sandbox.Executor }
+
+func (v *visorgraphTool) Name() string { return "visorgraph" }
+func (v *visorgraphTool) Description() string {
+	return "Infrastructure recon engine. CT log enumeration, HTTP probes, TLS analysis, exposure classification. Returns a typed provenance graph as compact JSON. First reach for general targets — IPs or domains. Pass no_active=true for passive-only when stealth matters."
+}
+func (v *visorgraphTool) ArgsSchema() string {
+	return `{"target":"<ip|domain>","no_active":false}`
+}
+func (v *visorgraphTool) Run(ctx context.Context, jsonArgs string) (string, error) {
+	var a visorgraphArgs
+	if err := json.Unmarshal([]byte(jsonArgs), &a); err != nil {
+		return "", fmt.Errorf("parse args: %w", err)
+	}
+	if a.Target == "" {
+		return "", fmt.Errorf("target required")
+	}
+	args := []string{}
+	if isIPLiteral(a.Target) {
+		args = append(args, "-ip", a.Target)
+	} else {
+		args = append(args, "-domain", a.Target)
+	}
+	args = append(args, "-no-stream") // compact final graph; full JSONL stream blows our token budget
+	if a.NoActive {
+		args = append(args, "-no-active")
+	}
+	return runAndFormat(ctx, v.exec, "visorgraph", args, 90*time.Second)
+}
+
+// ---------- aimap (NuClide AI/ML scanner) ----------
+
+type aimapArgs struct {
+	Target string `json:"target"`
+	Ports  string `json:"ports,omitempty"`
+}
+type aimapTool struct{ exec *sandbox.Executor }
+
+func (a *aimapTool) Name() string { return "aimap" }
+func (a *aimapTool) Description() string {
+	return "AI/ML infrastructure scanner. Fingerprints LLM endpoints, vector databases, model servers, agent platforms. Default port set covers Ollama/Triton/vLLM/ChromaDB/Qdrant/Weaviate/Milvus and 25+ other AI services. Reach when the target signals AI/ML or when visorgraph surfaces such ports."
+}
+func (a *aimapTool) ArgsSchema() string {
+	return `{"target":"<ip|host|cidr>","ports":"<comma-list, optional override>"}`
+}
+func (a *aimapTool) Run(ctx context.Context, jsonArgs string) (string, error) {
+	var args aimapArgs
+	if err := json.Unmarshal([]byte(jsonArgs), &args); err != nil {
+		return "", fmt.Errorf("parse args: %w", err)
+	}
+	if args.Target == "" {
+		return "", fmt.Errorf("target required")
+	}
+	cmdArgs := []string{"-target", args.Target, "-o", "/dev/stdout"}
+	if args.Ports != "" {
+		cmdArgs = append(cmdArgs, "-ports", args.Ports)
+	}
+	return runAndFormat(ctx, a.exec, "aimap", cmdArgs, 60*time.Second)
+}
+
+// isIPLiteral returns true if s parses as a v4 or v6 address.
+func isIPLiteral(s string) bool {
+	return net.ParseIP(s) != nil
+}
+
+// ---------- httpx (DEPRECATED — not registered by default) ----------
 
 type httpxArgs struct {
 	Target string `json:"target"`

@@ -36,10 +36,12 @@ differ from on-prem.
    non-proxied subdomains (api., dev., staging.).
 
 ## Tooling order
-- httpx for HTTP/TLS surface enumeration with -tls-probe -title -tech-detect
-- asnmap for ASN attribution
-- nuclei with cloud-config templates for misconfigurations
-- naabu for top-port sweep before deep dive
+- visorgraph as primary recon — its TLS probe extracts cert SANs that often
+  name the actual customer/tenant on shared cloud infra (AWS ALB, GCP LB,
+  Cloudflare-fronted). Its HTTP probe captures Server header + tech stack.
+  CT log enumeration surfaces sibling subdomains under the same CA cert.
+- aimap as secondary if visorgraph's HTTP fingerprint surfaces AI/ML
+  service ports (Ollama 11434, Triton 8000-8002, vLLM 5000, ChromaDB 8000).
 
 ## Key references
 - AWS: https://ip-ranges.amazonaws.com/ip-ranges.json

@@ -32,10 +32,11 @@ debug endpoints.
 - Laravel: laravel_session cookie, X-Powered-By: PHP
 
 ## Tooling order
-- httpx for surface enumeration and tech detection
-- nuclei with technologies/, exposures/, misconfiguration/ templates
-- ffuf or gobuster for content discovery on confirmed targets
-- nikto for legacy web server vulnerabilities
+- visorgraph for surface enumeration — CT logs reveal subdomains, HTTP probes
+  surface titles + tech stack, TLS analysis pulls cert SANs and OV/EV
+  customer attribution. One call returns a typed provenance graph.
+- Targeted content discovery and vuln scanning are out of VisorRAG's current
+  toolset — flag promising surface for manual follow-up by the operator.
 
 ## Auth bypass / quick wins to check
 - Default credentials on admin panels (admin/admin, admin/password)

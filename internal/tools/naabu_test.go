@@ -2,8 +2,26 @@ package tools
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 )
+
+// TestDefaultRegistryLineup pins the NuClide default tool set. Anyone
+// adding a probe must consciously update this assertion — guards against
+// silently re-introducing the deprecated PD wrappers (httpx/nuclei/asnmap/
+// naabu) that were dropped after 7 live runs surfaced their hygiene
+// problems on real targets.
+func TestDefaultRegistryLineup(t *testing.T) {
+	t.Parallel()
+	r := NewRegistry(nil) // exec=nil is fine; we only inspect names
+	got := r.Names()
+	sort.Strings(got)
+	want := []string{"aimap", "visorgraph"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("default registry tools = %v, want %v", got, want)
+	}
+}
+
 
 func TestNaabuPortFlag(t *testing.T) {
 	t.Parallel()

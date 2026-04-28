@@ -37,10 +37,12 @@ unauth endpoints, surface schema introspection.
 - /api/export, /api/download — auth + IDOR + path traversal
 
 ## Tooling order
-- httpx for HTTP enumeration
-- ffuf / gobuster with API-specific wordlists (api-endpoints.txt)
-- nuclei with exposures/apis/, technologies/, vulnerabilities/ templates
-- For GraphQL: clairvoyance, graphql-cop, inql
+- visorgraph for HTTP/TLS surface enumeration — captures Server header,
+  tech stack, redirects, cert SANs. Enough to identify the API gateway
+  fingerprint (Apigee, Kong, AWS API Gateway, etc.) and route the next move.
+- Targeted endpoint fuzzing and GraphQL introspection are out of VisorRAG's
+  current toolset — flag promising auth surfaces for manual follow-up by
+  the operator.
 
 ## Telltale headers
 - X-RateLimit-Limit / X-RateLimit-Remaining — confirms API gateway
