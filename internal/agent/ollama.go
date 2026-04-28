@@ -32,7 +32,14 @@ func NewOllama() (*OllamaModel, error) {
 	}
 	model := os.Getenv("VISORRAG_MODEL")
 	if model == "" {
-		model = "llama3.1"
+		// qwen2.5:7b-instruct: validated 2026-04-28 against scanme.nmap.org
+		// + Cortex postprocessor. 9.4-min run on rooster CPU. No hallucinated
+		// services. Epistemic discipline (flags its own extrapolation when
+		// findings don't cover it). Same Ollama tool-calling reliability as
+		// qwen2.5:3b. Sweet spot for local CPU inference + grounded output.
+		// llama3.1:8b skipped — emits text-style "fake" tool calls instead
+		// of structured tool_calls field.
+		model = "qwen2.5:7b-instruct"
 	}
 	return &OllamaModel{
 		endpoint: strings.TrimSuffix(host, "/"),
