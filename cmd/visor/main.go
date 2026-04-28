@@ -138,6 +138,51 @@ func main() {
 	root.Flags().BoolVar(&cortex, "cortex", false, "after the recon loop, draft a Cortex authorization-context artifact and run analyzer.py")
 	root.Flags().StringVar(&cortexDir, "cortex-dir", "", "path to cortex-framework checkout (default $VISORRAG_CORTEX_DIR or ~/cortex-framework)")
 
+	// ---- recall subcommand ----
+	var recallLimit int
+	recall := &cobra.Command{
+		Use:           "recall <target>",
+		Short:         "Show prior findings persisted for a target (no LLM, no probes)",
+		Args:          cobra.ExactArgs(1),
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target := args[0]
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+
+			resolved, err := resolveStateDir(stateDir, false)
+			if err != nil {
+				return err
+			}
+			ragEngine, err := rag.NewPersistent(ctx, resolved)
+			if err != nil {
+				return fmt.Errorf("rag init: %w", err)
+			}
+			if !ragEngine.HasPersistence() {
+				return fmt.Errorf("persistence layer not available at %s", resolved)
+			}
+			fmt.Fprintf(os.Stderr, "visor recall: store=%s total_findings=%d\n",
+				ragEngine.FindingsDir(), ragEngine.FindingsCount())
+
+			findings, err := ragEngine.FindingsForTarget(ctx, target, recallLimit)
+			if err != nil {
+				return fmt.Errorf("query: %w", err)
+			}
+			if len(findings) == 0 {
+				fmt.Fprintf(os.Stderr, "no findings for %s\n", target)
+				return nil
+			}
+			enc := json.NewEncoder(os.Stdout)
+			for _, f := range findings {
+				_ = enc.Encode(f)
+			}
+			return nil
+		},
+	}
+	recall.Flags().IntVar(&recallLimit, "limit", 50, "max findings to return")
+	root.AddCommand(recall)
+
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "visor:", err)
 		os.Exit(1)
