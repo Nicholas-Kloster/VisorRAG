@@ -44,7 +44,7 @@ func NewOllama() (*OllamaModel, error) {
 	return &OllamaModel{
 		endpoint: strings.TrimSuffix(host, "/"),
 		model:    model,
-		hc:       &http.Client{Timeout: 5 * time.Minute},
+		hc:       &http.Client{Timeout: llmTimeout(10 * time.Minute)},
 	}, nil
 }
 

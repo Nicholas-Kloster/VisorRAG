@@ -41,8 +41,18 @@ func NewAnthropic() (*AnthropicModel, error) {
 		model:     model,
 		endpoint:  strings.TrimSuffix(ep, "/"),
 		maxTokens: 4096,
-		hc:        &http.Client{Timeout: 120 * time.Second},
+		hc:        &http.Client{Timeout: llmTimeout(2 * time.Minute)},
 	}, nil
+}
+
+// llmTimeout reads VISORRAG_LLM_TIMEOUT (Go duration) or returns the default.
+func llmTimeout(def time.Duration) time.Duration {
+	if v := os.Getenv("VISORRAG_LLM_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
 }
 
 func (a *AnthropicModel) Name() string { return "anthropic:" + a.model }

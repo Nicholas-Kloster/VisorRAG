@@ -61,7 +61,7 @@ func NewOpenAICompat() (*OpenAICompatModel, error) {
 		endpoint:  strings.TrimSuffix(endpoint, "/"),
 		maxTokens: 4096,
 		label:     fmt.Sprintf("%s:%s", providerLabel, model),
-		hc:        &http.Client{Timeout: 120 * time.Second},
+		hc:        &http.Client{Timeout: llmTimeout(2 * time.Minute)},
 	}, nil
 }
 
