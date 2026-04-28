@@ -40,16 +40,23 @@ type Registry struct {
 	order []string
 }
 
-// NewRegistry builds the default NuClide tool lineup. visorgraph is the
-// general-purpose recon engine (CT logs + HTTP + TLS + exposure
-// classification). aimap is the AI/ML-specific scanner. Both are Go static
-// binaries authored under the NuClide umbrella; both produce dense JSON
-// observations the agent can reason over directly.
+// NewRegistry builds the default NuClide tool lineup.
+//
+//   - visorgraph: general infra recon (CT logs + HTTP + TLS + exposure
+//     classification). Default reach for unknown targets.
+//   - aimap:      AI/ML-specific scanner (LLM endpoints, vector DBs, model
+//     servers, agent platforms — 36 service fingerprints).
+//   - menlohunt:  GCP External Attack Surface Management (5-phase scan with
+//     attack chain detection). Reach when target signals Google Cloud.
+//
+// All three are Go static binaries authored under the NuClide umbrella;
+// all three produce dense JSON observations the agent can reason over.
 func NewRegistry(exec *sandbox.Executor) *Registry {
 	r := NewEmpty()
 	r.exec = exec
 	r.Register(&visorgraphTool{exec: exec})
 	r.Register(&aimapTool{exec: exec})
+	r.Register(&menlohuntTool{exec: exec})
 	return r
 }
 
@@ -151,6 +158,50 @@ func (a *aimapTool) Run(ctx context.Context, jsonArgs string) (string, error) {
 // isIPLiteral returns true if s parses as a v4 or v6 address.
 func isIPLiteral(s string) bool {
 	return net.ParseIP(s) != nil
+}
+
+// ---------- menlohunt (NuClide GCP EASM) ----------
+
+type menlohuntArgs struct {
+	Target string `json:"target"`
+	NoICMP bool   `json:"no_icmp,omitempty"`
+}
+type menlohuntTool struct{ exec *sandbox.Executor }
+
+func (m *menlohuntTool) Name() string { return "menlohunt" }
+func (m *menlohuntTool) Description() string {
+	return "GCP External Attack Surface Management. 5-phase scan: ports, raw protocols (Redis/MongoDB/Memcached), HTTP fingerprinting (Kubelets/Docker/MLflow), TLS analysis (extracts internal IP leaks + GCP project IDs from cert SANs), GCP-specific surface (Metadata API, GCS, Firebase). Built-in attack chain detection. Reach when target ASN/IP suggests Google Cloud, or when visorgraph cert SANs surface a GCP project ID."
+}
+func (m *menlohuntTool) ArgsSchema() string {
+	return `{"target":"<ip-or-hostname>","no_icmp":false}`
+}
+func (m *menlohuntTool) Run(ctx context.Context, jsonArgs string) (string, error) {
+	var a menlohuntArgs
+	if err := json.Unmarshal([]byte(jsonArgs), &a); err != nil {
+		return "", fmt.Errorf("parse args: %w", err)
+	}
+	if a.Target == "" {
+		return "", fmt.Errorf("target required")
+	}
+	// menlohunt's scan subcommand takes -ip only. Resolve hostname → first
+	// A record on the host before crossing into the sandbox. DNS lookup
+	// here is a benign host-side operation.
+	ip := a.Target
+	if !isIPLiteral(a.Target) {
+		addrs, err := net.LookupHost(a.Target)
+		if err != nil {
+			return "", fmt.Errorf("resolve %s: %w", a.Target, err)
+		}
+		if len(addrs) == 0 {
+			return "", fmt.Errorf("no addresses for %s", a.Target)
+		}
+		ip = addrs[0]
+	}
+	args := []string{"scan", "-ip", ip}
+	if a.NoICMP {
+		args = append(args, "-no-icmp")
+	}
+	return runAndFormat(ctx, m.exec, "menlohunt", args, 90*time.Second)
 }
 
 // ---------- httpx (DEPRECATED — not registered by default) ----------

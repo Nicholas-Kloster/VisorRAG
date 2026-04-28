@@ -40,6 +40,11 @@ differ from on-prem.
   name the actual customer/tenant on shared cloud infra (AWS ALB, GCP LB,
   Cloudflare-fronted). Its HTTP probe captures Server header + tech stack.
   CT log enumeration surfaces sibling subdomains under the same CA cert.
+- menlohunt for GCP-specific deep recon when target IP resolves to Google's
+  ASN ranges. 5-phase scan including raw-protocol checks (Redis/MongoDB/
+  Memcached unauth), Metadata API exposure, GCS bucket discovery, Firebase
+  reachability, and built-in attack chain correlation. Returns a single
+  dense JSON report with severity-graded findings.
 - aimap as secondary if visorgraph's HTTP fingerprint surfaces AI/ML
   service ports (Ollama 11434, Triton 8000-8002, vLLM 5000, ChromaDB 8000).
 

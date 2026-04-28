@@ -16,7 +16,7 @@ func TestDefaultRegistryLineup(t *testing.T) {
 	r := NewRegistry(nil) // exec=nil is fine; we only inspect names
 	got := r.Names()
 	sort.Strings(got)
-	want := []string{"aimap", "visorgraph"}
+	want := []string{"aimap", "menlohunt", "visorgraph"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("default registry tools = %v, want %v", got, want)
 	}
