@@ -16,18 +16,25 @@ import (
 
 // PickModel selects an LLM provider:
 //
-//   - VISORRAG_LLM=anthropic|ollama  → forced
-//   - ANTHROPIC_API_KEY set          → Anthropic (default cloud)
-//   - else                           → Ollama (default local)
+//   - VISORRAG_LLM=anthropic|ollama|groq|openai → forced
+//   - ANTHROPIC_API_KEY set                     → Anthropic (direct)
+//   - GROQ_API_KEY set                          → Groq (OpenAI-compat preset)
+//   - OPENAI_API_KEY set                        → OpenAI (or OPENAI_BASE_URL compat)
+//   - else                                      → Ollama (default local)
 func PickModel() (Model, error) {
 	switch strings.ToLower(os.Getenv("VISORRAG_LLM")) {
 	case "anthropic":
 		return NewAnthropic()
 	case "ollama":
 		return NewOllama()
+	case "groq", "openai":
+		return NewOpenAICompat()
 	}
 	if os.Getenv("ANTHROPIC_API_KEY") != "" {
 		return NewAnthropic()
+	}
+	if os.Getenv("GROQ_API_KEY") != "" || os.Getenv("OPENAI_API_KEY") != "" {
+		return NewOpenAICompat()
 	}
 	return NewOllama()
 }
