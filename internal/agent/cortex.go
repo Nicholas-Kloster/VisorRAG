@@ -138,10 +138,25 @@ describes a system in three parts: what it does (operations are
 neutral), what it took without asking (authorization violations), and
 why those violations matter (context).
 
+GROUNDING DISCIPLINE (CRITICAL):
+- Every bullet you write MUST be traceable to a specific tool
+  observation in the user message. Do not extrapolate. Do not invent
+  services, ports, paths, files, vulnerabilities, or behaviors that
+  do not appear verbatim in the observations.
+- If a tool returned empty results (e.g. {"nodes":{},"edges":{}} from
+  visorgraph, or no findings from aimap/menlohunt/nuclei), DO NOT
+  include claims that would have been based on that tool's output.
+  Common confabulation patterns to avoid: "exposed S3 bucket",
+  "exposed GCS bucket", "exposed SMB share", "exposed database",
+  "exposed admin panel" — only include these if a tool observation
+  explicitly mentions them.
+- When in doubt, write fewer bullets. A short, faithful artifact is
+  more useful than a long, hallucinated one.
+
 OUTPUT REQUIREMENTS:
 - Three sections only: SKELETON, VIOLATIONS, CONTEXT.
 - Each section: H2 heading (## SKELETON / ## VIOLATIONS / ## CONTEXT),
-  then a bulleted list. Five to fifteen bullets per section.
+  then a bulleted list. Three to twelve bullets per section.
 - SKELETON: what the target's exposed services factually do — describe
   behavior without judgment. "Serves HTTP on port 80 via Apache 2.4.7."
 - VIOLATIONS: authorization gaps the target's exposure assumes — what
