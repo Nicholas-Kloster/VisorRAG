@@ -53,6 +53,15 @@ func New(timeout time.Duration) (*Executor, error) {
 // Currently checked:
 //   - $VISORRAG_NUCLEI_TEMPLATES or ~/nuclei-templates → /nuclei-templates
 //   - $VISORRAG_OSV_DATABASE or ~/.cache/osv-scanner   → /osv-cache
+//
+// IMPORTANT: rootless gVisor uses user namespaces with subuid mapping —
+// UIDs inside the sandbox do NOT match host UIDs. Files owned by the
+// invoking user (default 700 perms) are NOT readable from inside. Data
+// corpora must be world-readable (mode 755 dirs, 644 files) for the
+// sandbox to access them. Fresh installs may need:
+//   chmod o+x ~                    # traverse
+//   chmod -R o+rX ~/nuclei-templates
+// or symlink/copy the corpus to a system path like /opt/.
 func autoDetectDataMounts() []runsc.BindMount {
 	var out []runsc.BindMount
 	for _, mp := range []struct {
