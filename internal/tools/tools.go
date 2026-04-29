@@ -126,7 +126,7 @@ type visorgraphTool struct{ exec *sandbox.Executor }
 
 func (v *visorgraphTool) Name() string { return "visorgraph" }
 func (v *visorgraphTool) Description() string {
-	return "Infrastructure recon engine. CT log enumeration, HTTP probes, TLS analysis, exposure classification. Returns a typed provenance graph as compact JSON. First reach for general targets — IPs or domains. Pass no_active=true for passive-only when stealth matters."
+	return "Infrastructure recon engine. CT log enumeration, HTTP probes, TLS analysis, exposure classification. Returns a typed provenance graph as compact JSON. First reach for general targets — IPs or domains. Default leaves no_active=false (active probing enabled) which is what you want for authorized recon. Set no_active=true ONLY when the operator has explicitly required stealth/passive mode — rare; using it on a normal authorized engagement returns empty results."
 }
 func (v *visorgraphTool) ArgsSchema() string {
 	return `{"target":"<ip|domain>","no_active":false}`
