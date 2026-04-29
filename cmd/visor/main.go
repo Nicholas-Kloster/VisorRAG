@@ -52,6 +52,12 @@ func main() {
 		Short:         "Agentic recon over a RAG-grounded LLM with gVisor-sandboxed probes",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			if !quiet {
+				printBanner()
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if target == "" {
 				return fmt.Errorf("--target is required")
@@ -239,5 +245,42 @@ func resolveStateDir(flag string, ephemeral bool) (string, error) {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
 	return filepath.Join(home, ".visor-rag", "state"), nil
+}
+
+func printBanner() {
+	const (
+		cyBright = "\033[38;2;0;153;204m"
+		cyDark   = "\033[38;2;13;55;90m"
+		cyFaint  = "\033[38;2;55;90;120m"
+		rst      = "\033[0m"
+		bld      = "\033[1m"
+	)
+	// Network graph mascot — echoes the V+node logo.
+	graph := [7]string{
+		`  o───o  `,
+		` /|    \ `,
+		`o |    o `,
+		` \|   /  `,
+		`  o───o  `,
+		`    |    `,
+		`    o    `,
+	}
+	// doom font — VisorRAG
+	logo := [7]string{
+		` _   _ _               ______  ___  _____ `,
+		`| | | (_)              | ___ \/ _ \|  __ \`,
+		`| | | | / __|/ _ \| '__|    /|  _  | | __ `,
+		`| | | | \__ \ (_) | |  | |\ \| | | | |_\ \`,
+		` \___/|_|___/\___/|_|  \_| \_\_| |_/\____/`,
+		`                                           `,
+		`                                           `,
+	}
+	fmt.Fprintln(os.Stderr)
+	for i := range logo {
+		fmt.Fprintf(os.Stderr, "   %s%-9s%s   %s%s%s%s\n",
+			cyDark, graph[i], rst, cyBright, bld, logo[i], rst)
+	}
+	meta := "────  agentic recon  ·  gVisor-sandboxed  ────"
+	fmt.Fprintf(os.Stderr, "\n%s%s%s\n\n", strings.Repeat(" ", 15), cyFaint+meta, rst)
 }
 
