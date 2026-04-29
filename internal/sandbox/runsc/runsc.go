@@ -287,13 +287,29 @@ func buildOCIConfig(rootfs, binPath string, args []string, extraMounts []BindMou
 		})
 	}
 
+	// Sandbox UID/GID: match the host invoker's UID. Earlier we ran as
+	// nobody (65534) for defense-in-depth, but that meant bind-mounted
+	// data corpora (nuclei-templates, etc.) under the user's home dir
+	// were unreadable from inside the container due to host-level perms
+	// (typical 750 on /home/cowboy). The threat model trade-off:
+	//   - Lost: a sandbox-escape attacker would now get the host UID
+	//     instead of nobody. But gVisor's primary security guarantee is
+	//     syscall interception, not UID separation — escapes from
+	//     syscall interception are vanishingly rare and would compromise
+	//     either UID equivalently in practice.
+	//   - Gained: zero-config bind-mounted corpora work. Nuclei's 12,958
+	//     templates, OSV cache, etc. are accessible without chmod
+	//     dances or copying to /opt.
+	uid := uint32(os.Getuid())
+	gid := uint32(os.Getgid())
+
 	return &ociConfig{
 		OCIVersion: ociVersion,
 		Process: ociProcess{
 			Terminal: false,
-			User:     ociUser{UID: 65534, GID: 65534},
+			User:     ociUser{UID: uid, GID: gid},
 			Args:     append([]string{"/rg-probe"}, args...),
-			Env:      []string{"PATH=/", "HOME=/tmp", "USER=nobody"},
+			Env:      []string{"PATH=/", "HOME=/tmp", "USER=visor"},
 			Cwd:      "/tmp",
 			Capabilities: &ociCapabilities{
 				Bounding:  []string{"CAP_NET_RAW"},
