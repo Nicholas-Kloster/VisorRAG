@@ -16,7 +16,10 @@ func TestDefaultRegistryLineup(t *testing.T) {
 	r := NewRegistry(nil) // exec=nil is fine; we only inspect names
 	got := r.Names()
 	sort.Strings(got)
-	want := []string{"aimap", "bare", "menlohunt", "visorgraph"}
+	// Default lineup when no nuclei-templates dir is present (exec=nil →
+	// hasMount returns false → nuclei skipped). osv-scanner has no
+	// templates dependency, so it always registers.
+	want := []string{"aimap", "bare", "menlohunt", "osvscan", "visorgraph"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("default registry tools = %v, want %v", got, want)
 	}

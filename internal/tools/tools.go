@@ -69,6 +69,7 @@ func NewRegistry(exec *sandbox.Executor) *Registry {
 	if hasMount(exec, "/nuclei-templates") {
 		r.Register(&nucleiTemplatedTool{exec: exec})
 	}
+	r.Register(&osvscanTool{exec: exec})
 	return r
 }
 
@@ -432,6 +433,118 @@ func (n *nucleiTemplatedTool) Run(ctx context.Context, jsonArgs string) (string,
 		return fmt.Sprintf("(no nuclei hits at severity=%s tags=%s)", severity, strings.Join(a.Tags, ",")), nil
 	}
 	return distillNucleiJSONL(out), nil
+}
+
+// ---------- osv-scanner (Google OSV vulnerability scanner) ----------
+
+type osvscanArgs struct {
+	Image string `json:"image"`
+}
+type osvscanTool struct{ exec *sandbox.Executor }
+
+func (o *osvscanTool) Name() string { return "osvscan" }
+func (o *osvscanTool) Description() string {
+	return "Container image vulnerability scanner via Google's OSV database. Pulls a Docker image reference, identifies dependencies inside layers (Go binaries, OS packages, language ecosystems), cross-references against the OSV.dev CVE database. Reach when a target exposes a Docker Registry (port 5000, /v2/_catalog) and you've identified pullable image refs — feed those to osvscan for layer-level CVE enumeration. Less useful for plain web/HTTP recon (nuclei is the right tool there)."
+}
+func (o *osvscanTool) ArgsSchema() string {
+	return `{"image":"<docker image ref like nginx:1.20.0 or registry.example.com/foo/bar@sha256:...>"}`
+}
+func (o *osvscanTool) Run(ctx context.Context, jsonArgs string) (string, error) {
+	var a osvscanArgs
+	if err := json.Unmarshal([]byte(jsonArgs), &a); err != nil {
+		return "", fmt.Errorf("parse args: %w", err)
+	}
+	if a.Image == "" {
+		return "", fmt.Errorf("image required")
+	}
+	cmdArgs := []string{
+		"scan", "image", a.Image,
+		"--format", "json",
+	}
+	subCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	r, err := o.exec.Execute(subCtx, "osv-scanner", cmdArgs...)
+	if err != nil {
+		return "", fmt.Errorf("sandboxed osv-scanner: %w", err)
+	}
+	out := strings.TrimSpace(r.Stdout)
+	if out == "" && r.Stderr != "" {
+		return "(no stdout) stderr: " + strings.TrimSpace(r.Stderr), nil
+	}
+	if out == "" {
+		return fmt.Sprintf("(empty result; exit=%d duration=%s)", r.ExitCode, r.Duration), nil
+	}
+	return distillOSVScanJSON(out), nil
+}
+
+// distillOSVScanJSON compacts osv-scanner's verbose JSON output to one line
+// per vulnerability with fields the agent actually needs.
+func distillOSVScanJSON(raw string) string {
+	type vuln struct {
+		ID       string   `json:"id"`
+		Aliases  []string `json:"aliases"`
+		Summary  string   `json:"summary"`
+		Severity []struct {
+			Score string `json:"score"`
+			Type  string `json:"type"`
+		} `json:"severity"`
+	}
+	type pkg struct {
+		Name      string `json:"name"`
+		Ecosystem string `json:"ecosystem"`
+		Version   string `json:"version"`
+	}
+	type result struct {
+		Source struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+		} `json:"source"`
+		Packages []struct {
+			Package         pkg     `json:"package"`
+			Vulnerabilities []vuln  `json:"vulnerabilities"`
+		} `json:"packages"`
+	}
+	type top struct {
+		Results []result `json:"results"`
+	}
+
+	var t top
+	if err := json.Unmarshal([]byte(raw), &t); err != nil {
+		// Couldn't parse — emit raw output truncated.
+		if len(raw) > 4000 {
+			return raw[:4000] + "\n…[truncated]"
+		}
+		return raw
+	}
+
+	var sb strings.Builder
+	total := 0
+	for _, res := range t.Results {
+		for _, p := range res.Packages {
+			for _, v := range p.Vulnerabilities {
+				total++
+				fmt.Fprintf(&sb, "[%s/%s@%s] %s — %s",
+					p.Package.Ecosystem, p.Package.Name, p.Package.Version,
+					v.ID, truncateString(v.Summary, 120))
+				if len(v.Aliases) > 0 {
+					fmt.Fprintf(&sb, " (aliases: %s)", strings.Join(v.Aliases, ","))
+				}
+				sb.WriteByte('\n')
+			}
+		}
+	}
+	if total == 0 {
+		return "(no vulnerabilities found in image dependencies)"
+	}
+	fmt.Fprintf(&sb, "\nTotal vulnerabilities: %d", total)
+	return strings.TrimSpace(sb.String())
+}
+
+func truncateString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // distillNucleiJSONL reads nuclei's verbose JSONL output and emits one
