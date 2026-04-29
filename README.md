@@ -5,6 +5,18 @@
 <h1 align="center">VisorRAG</h1>
 <p align="center"><em>Agentic recon driven by a RAG-grounded LLM · every probe sandboxed in gVisor</em></p>
 
+```
+     o───o     _   _ _               ______  ___  _____ 
+    /|    \   | | | (_)              | ___ \/ _ \|  __ \
+   o |    o   | | | | / __|/ _ \| '__|    /|  _  | | __ 
+    \|   /    | | | | \__ \ (_) | |  | |\ \| | | | |_\ \
+     o───o     \___/|_|___/\___/|_|  \_| \_\_| |_/\____/
+       |    
+       o    
+
+               ────  agentic recon  ·  gVisor-sandboxed  ────
+```
+
 ---
 
 ## What it is
