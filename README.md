@@ -9,9 +9,13 @@
 
 ## What it is
 
-VisorRAG is a single binary that wraps a ReAct-loop LLM agent over a two-collection vector store. You hand it a target; it decides what to probe, runs each tool in an isolated gVisor sandbox, embeds the observations into a persistent findings store, and iterates until it has a picture of the attack surface.
+VisorRAG is an LLM-driven security reconnaissance agent that closes the loop between discovery and memory. The core loop is **Retrieve → Think → Act → Observe**: before each LLM turn, a RAG engine pulls the top-scoring playbook chunk per source (web, cloud, API, AI/ML) and the last 6 confirmed findings for the exact target — so the model reasons over empirical ground truth, not stale assumptions. Tool observations are embedded and persisted between runs, which means a second scan doesn't restart from scratch. The agent sees what it already confirmed, skips redundant probes, and looks for drift.
 
-The default tool lineup is NuClide-authored — VisorGraph for provenance-graph recon and aimap for AI/ML service deep enumeration — chosen specifically because commodity scanners (nuclei, httpx, naabu) hit auth walls and template directory requirements that make unattended runs unreliable.
+Every probe runs inside a gVisor OCI bundle: readonly rootfs, a single capability (CAP\_NET\_RAW for raw sockets), explicit namespace isolation, and a 512 MB memory ceiling. The agent process — which holds API keys, decision state, and the full RAG memory — never shares a process boundary with probe execution. This isn't container-level isolation; gVisor intercepts syscalls directly, so even a compromised probe binary can't reach the host.
+
+The tool set is intentionally narrow and NuClide-authored. VisorGraph maps infrastructure provenance in a single pass (CT logs, HTTP, TLS, exposure classification). aimap fingerprints 36 AI/ML services — Ollama, vLLM, ChromaDB, Qdrant, MLflow — against the exact ports where they actually run. menlohunt does GCP-specific surface work: cert SAN extraction for project ID leaks, metadata API, GCS discovery. BARE takes any finding and semantic-searches 3,904 Metasploit modules to rank exploit relevance. Nuclei and osv-scanner register conditionally when their dependencies are present. Commodity scanners (httpx, naabu, asnmap) are defined but not in the default registry — seven live runs showed they hit auth walls, missing template directories, and preset rejections that the purpose-built tools sidestep by design.
+
+The system prompt enforces tool discipline explicitly: the LLM is told that playbook text may reference tools that are not in its function-calling spec, and it may never fabricate a call for a name it only saw in markdown. Schema type inference (number vs string) makes the same tool definitions work across strict providers like Groq without manual schema adjustment. `--manual` mode gates every invocation through an interactive y/n prompt; a rejection becomes a negation the model sees and routes around. `--cortex` adds a post-recon pass that drafts a formal authorization-context artifact against the observed attack surface.
 
 ---
 
