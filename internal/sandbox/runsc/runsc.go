@@ -103,6 +103,30 @@ func RunSandboxed(ctx context.Context, runscPath string, cmd []string, timeout t
 		return nil, err
 	}
 
+	// Pre-create bind-mount target directories inside the rootfs. With a
+	// readonly rootfs, runsc can't auto-create these at mount time — the
+	// targets must exist before the container starts. Without this,
+	// extraMounts (nuclei-templates, osv-cache, etc.) silently fail and
+	// the binary inside reports "no templates" or similar.
+	for _, m := range extraMounts {
+		if m.ContainerPath == "" {
+			continue
+		}
+		target := filepath.Join(rootfs, m.ContainerPath)
+		// If the host source is a regular file, create a placeholder file
+		// at the target. If it's a directory, create the dir.
+		if info, err := os.Stat(m.HostPath); err == nil {
+			if info.IsDir() {
+				_ = os.MkdirAll(target, 0o755)
+			} else {
+				_ = os.MkdirAll(filepath.Dir(target), 0o755)
+				if f, err := os.Create(target); err == nil {
+					f.Close()
+				}
+			}
+		}
+	}
+
 	cid := containerID()
 	cfg := buildOCIConfig(rootfs, binPath, cmd[1:], extraMounts)
 	cfgJSON, err := json.MarshalIndent(cfg, "", "  ")
