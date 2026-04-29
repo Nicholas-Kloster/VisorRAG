@@ -41,22 +41,24 @@ type Registry struct {
 	order []string
 }
 
-// NewRegistry builds the default NuClide tool lineup.
+// NewRegistry builds the default tool lineup.
 //
-//   - visorgraph: general infra recon (CT logs + HTTP + TLS + exposure
-//     classification). Default reach for unknown targets.
-//   - aimap:      AI/ML-specific scanner (LLM endpoints, vector DBs, model
-//     servers, agent platforms — 36 service fingerprints).
-//   - menlohunt:  GCP External Attack Surface Management (5-phase scan with
-//     attack chain detection). Reach when target signals Google Cloud.
-//   - bare:       post-recon exploit ranking. Takes finding descriptions,
-//     returns ranked Metasploit modules via embedded BERT semantic search
-//     against a 3,904-module corpus. Use after recon tools have produced
-//     concrete findings.
+//   - visorgraph: NuClide general infra recon (CT logs + HTTP + TLS +
+//     exposure classification). Default reach for unknown targets.
+//   - aimap:      NuClide AI/ML-specific scanner (36 service fingerprints).
+//   - menlohunt:  NuClide GCP EASM (5-phase + attack chain detection).
+//   - bare:       NuClide post-recon exploit ranking via embedded BERT vs
+//     a 3,904-module Metasploit corpus.
+//   - nuclei:     ProjectDiscovery's vulnerability scanner with 12,958
+//     community-maintained pattern templates. Re-registered after the
+//     sandbox-bind-mounts extension exposed ~/nuclei-templates inside
+//     the container at /nuclei-templates. Brings 5+ years of operator
+//     pattern recognition without us authoring it ourselves.
 //
-// All four are NuClide-authored binaries. visorgraph/aimap/menlohunt are
-// Go static; bare is Rust. All produce structured JSON the agent can
-// reason over.
+// nuclei is registered only if its templates dir is mounted in the
+// sandbox's DefaultMounts (auto-detected from ~/nuclei-templates). When
+// the dir is absent, nuclei is skipped from the registry to avoid the
+// "no templates provided" failure surface.
 func NewRegistry(exec *sandbox.Executor) *Registry {
 	r := NewEmpty()
 	r.exec = exec
@@ -64,7 +66,24 @@ func NewRegistry(exec *sandbox.Executor) *Registry {
 	r.Register(&aimapTool{exec: exec})
 	r.Register(&menlohuntTool{exec: exec})
 	r.Register(&bareTool{exec: exec})
+	if hasMount(exec, "/nuclei-templates") {
+		r.Register(&nucleiTemplatedTool{exec: exec})
+	}
 	return r
+}
+
+// hasMount returns true if the executor's default mounts include the given
+// container path — used to gate tools that require a specific data corpus.
+func hasMount(exec *sandbox.Executor, containerPath string) bool {
+	if exec == nil {
+		return false
+	}
+	for _, m := range exec.DefaultMounts {
+		if m.ContainerPath == containerPath {
+			return true
+		}
+	}
+	return false
 }
 
 // NewEmpty constructs a registry with no tools wired. Useful for tests
@@ -343,21 +362,30 @@ func (h *httpxTool) Run(ctx context.Context, jsonArgs string) (string, error) {
 
 // ---------- nuclei ----------
 
+// nucleiTemplatedTool is the working nuclei wrapper. The earlier broken
+// one (called nucleiTool, dropped from default registry) failed because
+// templates weren't reachable inside the gVisor sandbox. This version
+// requires sandbox.Executor.DefaultMounts to expose ~/nuclei-templates at
+// /nuclei-templates inside the container — gated at registration time
+// via hasMount(). When templates aren't present, the tool isn't
+// registered, so the agent never gets a "no templates" failure mode.
+
 type nucleiArgs struct {
 	Target   string   `json:"target"`
 	Tags     []string `json:"tags,omitempty"`
 	Severity string   `json:"severity,omitempty"`
 }
-type nucleiTool struct{ exec *sandbox.Executor }
 
-func (n *nucleiTool) Name() string { return "nuclei" }
-func (n *nucleiTool) Description() string {
-	return "Templated vulnerability + misconfig scanner. Use specific -tags to keep it targeted."
+type nucleiTemplatedTool struct{ exec *sandbox.Executor }
+
+func (n *nucleiTemplatedTool) Name() string { return "nuclei" }
+func (n *nucleiTemplatedTool) Description() string {
+	return "Templated vulnerability + misconfig scanner with the full ProjectDiscovery community template corpus (12,958 templates: CVEs, exposures, tech detection, misconfigurations, default creds, default-files). Returns one JSONL hit per matched template with template-id, severity, matched-at URL, and reference URLs. Default severity high,critical for signal/noise. Reach AFTER recon tools (visorgraph/aimap/menlohunt) have produced concrete signals — feed those signals as targets to focus the scan."
 }
-func (n *nucleiTool) ArgsSchema() string {
-	return `{"target":"<url|host>","tags":["exposure","tech","cve"],"severity":"low,medium,high,critical"}`
+func (n *nucleiTemplatedTool) ArgsSchema() string {
+	return `{"target":"<url|ip|host>","tags":"<comma-list optional, e.g. cve,exposure,tech,misconfig>","severity":"<comma-list optional, default high,critical>"}`
 }
-func (n *nucleiTool) Run(ctx context.Context, jsonArgs string) (string, error) {
+func (n *nucleiTemplatedTool) Run(ctx context.Context, jsonArgs string) (string, error) {
 	var a nucleiArgs
 	if err := json.Unmarshal([]byte(jsonArgs), &a); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
@@ -365,21 +393,95 @@ func (n *nucleiTool) Run(ctx context.Context, jsonArgs string) (string, error) {
 	if a.Target == "" {
 		return "", fmt.Errorf("target required")
 	}
+	severity := a.Severity
+	if severity == "" {
+		severity = "high,critical"
+	}
 	args := []string{
 		"-u", a.Target,
+		"-t", "/nuclei-templates",
+		"-severity", severity,
 		"-silent",
 		"-no-color",
 		"-jsonl",
 		"-disable-update-check",
+		"-omit-raw",       // drop request/response bodies from JSONL — saves ~5KB per hit
+		"-omit-template",  // drop full template content from JSONL — saves another chunk
 		"-rate-limit", "50",
+		"-timeout", "8",
 	}
 	if len(a.Tags) > 0 {
 		args = append(args, "-tags", strings.Join(a.Tags, ","))
 	}
-	if a.Severity != "" {
-		args = append(args, "-severity", a.Severity)
+
+	subCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	r, err := n.exec.Execute(subCtx, "nuclei", args...)
+	if err != nil {
+		return "", fmt.Errorf("sandboxed nuclei: %w", err)
 	}
-	return runAndFormat(ctx, n.exec, "nuclei", args, 5*time.Minute)
+
+	// Distill each hit to a compact one-line summary the LLM can parse.
+	// Nuclei's JSONL is verbose even with -omit-raw/-omit-template; we keep
+	// only the fields that matter for security reasoning.
+	out := strings.TrimSpace(r.Stdout)
+	if out == "" && r.Stderr != "" {
+		return "(no nuclei hits) stderr: " + strings.TrimSpace(r.Stderr), nil
+	}
+	if out == "" {
+		return fmt.Sprintf("(no nuclei hits at severity=%s tags=%s)", severity, strings.Join(a.Tags, ",")), nil
+	}
+	return distillNucleiJSONL(out), nil
+}
+
+// distillNucleiJSONL reads nuclei's verbose JSONL output and emits one
+// compact line per hit with only the fields the agent needs for reasoning:
+// template-id, name, severity, tags, matched-at, extracted, references.
+// Truncates if the volume is still too large.
+func distillNucleiJSONL(raw string) string {
+	type hit struct {
+		TemplateID string `json:"template-id"`
+		Info       struct {
+			Name     string   `json:"name"`
+			Severity string   `json:"severity"`
+			Tags     []string `json:"tags"`
+			Refs     []string `json:"reference"`
+			Desc     string   `json:"description"`
+		} `json:"info"`
+		MatchedAt string   `json:"matched-at"`
+		Extracted []string `json:"extracted-results"`
+	}
+	var sb strings.Builder
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var h hit
+		if err := json.Unmarshal([]byte(line), &h); err != nil {
+			continue
+		}
+		fmt.Fprintf(&sb, "[%s] %s — %s @ %s",
+			h.Info.Severity, h.TemplateID, h.Info.Name, h.MatchedAt)
+		if len(h.Extracted) > 0 {
+			fmt.Fprintf(&sb, " | extracted: %s", strings.Join(h.Extracted, ", "))
+		}
+		if len(h.Info.Tags) > 0 {
+			fmt.Fprintf(&sb, " | tags: %s", strings.Join(h.Info.Tags, ","))
+		}
+		if h.Info.Desc != "" {
+			d := h.Info.Desc
+			if len(d) > 150 {
+				d = d[:150] + "…"
+			}
+			fmt.Fprintf(&sb, "\n  desc: %s", d)
+		}
+		if len(h.Info.Refs) > 0 {
+			fmt.Fprintf(&sb, "\n  refs: %s", strings.Join(h.Info.Refs, " "))
+		}
+		sb.WriteByte('\n')
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 // ---------- asnmap ----------

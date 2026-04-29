@@ -37,6 +37,14 @@ type ExecResult struct {
 	Duration    time.Duration
 }
 
+// BindMount is a host path made available read-only inside the sandbox at
+// a fixed container path. Used to expose data corpora (nuclei-templates)
+// or pre-built artifacts that probes need at runtime.
+type BindMount struct {
+	HostPath      string
+	ContainerPath string
+}
+
 func Detect() (string, error) {
 	// Order: prefer admin-installed (/usr/local) over distro-package
 	// (/usr/bin) so a fresh gvisor.dev release can shadow an outdated
@@ -71,8 +79,10 @@ func IsAvailable() bool {
 // exec.LookPath; cmd[1:] are passed as arguments to the bind-mounted binary at
 // /rg-probe inside the container. stdin (if non-nil) is piped to the
 // container init process — used by tools like BARE that read findings
-// JSON from stdin.
-func RunSandboxed(ctx context.Context, runscPath string, cmd []string, timeout time.Duration, stdin io.Reader) (*ExecResult, error) {
+// JSON from stdin. extraMounts are additional read-only bind mounts
+// available inside the container — used to expose data corpora like
+// nuclei-templates.
+func RunSandboxed(ctx context.Context, runscPath string, cmd []string, timeout time.Duration, stdin io.Reader, extraMounts []BindMount) (*ExecResult, error) {
 	if len(cmd) == 0 {
 		return nil, fmt.Errorf("empty command")
 	}
@@ -94,7 +104,7 @@ func RunSandboxed(ctx context.Context, runscPath string, cmd []string, timeout t
 	}
 
 	cid := containerID()
-	cfg := buildOCIConfig(rootfs, binPath, cmd[1:])
+	cfg := buildOCIConfig(rootfs, binPath, cmd[1:], extraMounts)
 	cfgJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return nil, err
@@ -217,7 +227,7 @@ type ociMemory struct {
 	Limit int64 `json:"limit"`
 }
 
-func buildOCIConfig(rootfs, binPath string, args []string) *ociConfig {
+func buildOCIConfig(rootfs, binPath string, args []string, extraMounts []BindMount) *ociConfig {
 	mounts := []ociMount{
 		{Destination: "/proc", Type: "proc", Source: "proc"},
 		{
@@ -261,6 +271,20 @@ func buildOCIConfig(rootfs, binPath string, args []string) *ociConfig {
 				Options:     []string{"rbind", "ro"},
 			})
 		}
+	}
+
+	// Caller-supplied data mounts (nuclei-templates, etc.). Read-only.
+	for _, m := range extraMounts {
+		if info, err := os.Stat(m.HostPath); err != nil || (info != nil && !info.IsDir() && !info.Mode().IsRegular()) {
+			continue
+		}
+		opt := "rbind"
+		mounts = append(mounts, ociMount{
+			Destination: m.ContainerPath,
+			Type:        "bind",
+			Source:      m.HostPath,
+			Options:     []string{opt, "ro"},
+		})
 	}
 
 	return &ociConfig{
