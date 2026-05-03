@@ -9,6 +9,20 @@
 
 ---
 
+## Use with Claude Code
+
+Claude Code can orchestrate VisorRAG runs, interpret the agent's reasoning trace, and extend findings into full disclosure reports or exploitation chains.
+
+```
+Run `visor --target 192.0.2.1 --max-steps 10` and pipe the output to a file. Then analyze the agent's ReAct trace: what did it discover, which tools did it invoke, what did each observation add to the picture, and what would be the next logical probe if the step limit hadn't been hit?
+```
+
+```
+I have a VisorRAG session log for target 10.0.0.0/24. Extract every confirmed finding, deduplicate by service type, classify each by OWASP LLM Top 10 category where applicable, and draft a structured disclosure report skeleton with one paragraph per finding.
+```
+
+---
+
 ## What it is
 
 VisorRAG is an LLM-driven security reconnaissance agent that closes the loop between discovery and memory. The core loop is **Retrieve → Think → Act → Observe**: before each LLM turn, a RAG engine pulls the top-scoring playbook chunk per source (web, cloud, API, AI/ML) and the last 6 confirmed findings for the exact target — so the model reasons over empirical ground truth, not stale assumptions. Tool observations are embedded and persisted between runs, which means a second scan doesn't restart from scratch. The agent sees what it already confirmed, skips redundant probes, and looks for drift.
@@ -100,20 +114,6 @@ Markdown documents embedded at build time and loaded into the RAG index on start
 | `api.md` | API reconnaissance, auth bypass, key enumeration |
 | `cloud.md` | Cloud asset enumeration, bucket discovery, metadata endpoints |
 | `web.md` | Web recon, header analysis, JS secrets, redirect chains |
-
----
-
-## Use with Claude Code
-
-Claude Code can orchestrate VisorRAG runs, interpret the agent's reasoning trace, and extend findings into full disclosure reports or exploitation chains.
-
-```
-Run `visor --target 192.0.2.1 --max-steps 10` and pipe the output to a file. Then analyze the agent's ReAct trace: what did it discover, which tools did it invoke, what did each observation add to the picture, and what would be the next logical probe if the step limit hadn't been hit?
-```
-
-```
-I have a VisorRAG session log for target 10.0.0.0/24. Extract every confirmed finding, deduplicate by service type, classify each by OWASP LLM Top 10 category where applicable, and draft a structured disclosure report skeleton with one paragraph per finding.
-```
 
 ---
 
