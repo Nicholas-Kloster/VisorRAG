@@ -129,3 +129,11 @@ Markdown documents embedded at build time and loaded into the RAG index on start
 ## License
 
 MIT
+
+---
+
+## About
+
+Maintained by **[Nicholas Michael Kloster](https://github.com/Nicholas-Kloster)** as part of [**NuClide**](https://nuclide-research.com) — independent AI infrastructure security research.
+
+CISA disclosures: [CVE-2025-4364](https://nvd.nist.gov/vuln/detail/CVE-2025-4364) · [ICSA-25-140-11](https://www.cisa.gov/news-events/ics-advisories/icsa-25-140-11)
